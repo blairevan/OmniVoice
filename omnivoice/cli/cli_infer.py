@@ -63,7 +63,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
-def parse_text_actions(text, newline_pause=0.1):
+def parse_text_actions(text, newline_pause=0.1, markup_version=None):
     """Parse text containing [pause:X] markup into a list of typed actions.
 
     Splits the input text on ``[pause:X]`` markers and returns an interleaved
@@ -82,22 +82,27 @@ def parse_text_actions(text, newline_pause=0.1):
     Example:
         >>> parse_text_actions("Hello[pause:1]World")
         [('text', 'Hello'), ('pause', 1.0), ('text', 'World')]
-        >>> parse_text_actions("Line1\\nLine2")
+        >>> parse_text_actions("Line1\nLine2")
         [('text', 'Line1'), ('pause', 0.3), ('text', 'Line2')]
     """
+    is_new = (markup_version == "26071300") or (not markup_version and "\x01" in text)
     # 将换行符转换为 pause 标记
     # 注意: shell 双引号中的 \n 是字面量反斜杠+n，不是真正的换行符
     # 需要同时处理两种情况
     if newline_pause > 0:
+        pause_tag = f"\x01[pause:{newline_pause}\x01]" if is_new else f"[pause:{newline_pause}]"
         # 字面量 \n (反斜杠+n) → pause
-        text = text.replace("\\n", f"[pause:{newline_pause}]")
+        text = text.replace("\\n", pause_tag)
         # 真正的换行符 → pause
-        text = text.replace("\n", f"[pause:{newline_pause}]")
+        text = text.replace("\n", pause_tag)
     else:
         text = text.replace("\\n", " ")
         text = text.replace("\n", " ")
 
-    pattern = r"\[pause:(\d+(?:\.\d+)?)\]"
+    if is_new:
+        pattern = r"\x01\[pause:(\d+(?:\.\d+)?)\x01\]"
+    else:
+        pattern = r"\[pause:(\d+(?:\.\d+)?)\]"
     parts = re.split(pattern, text)
 
     actions = []
@@ -110,7 +115,7 @@ def parse_text_actions(text, newline_pause=0.1):
     return actions
 
 
-def clean_text_for_synthesis(text):
+def clean_text_for_synthesis(text, markup_version=None):
     """Clean markup tags from text, producing TTS-friendly input.
 
     Strips all custom markup so the text can be fed directly to the model:
@@ -127,18 +132,31 @@ def clean_text_for_synthesis(text):
     """
     # 将换行符替换为空格
     text = text.replace("\n", " ").replace("\r", "")
-    # [replace:原文|替换词] -> 替换词
-    text = re.sub(
-        r"\[replace:([^|\]]+)\|([^\]]+)\]", lambda m: f" {m.group(2)} ", text
-    )
-    # [汉字|拼音] -> 拼音 (转大写以匹配模型训练时的格式)
-    text = re.sub(r"\[([^|\]]+)\|([^\]]+)\]", lambda m: f" {m.group(2).upper()} ", text)
-    # [connect:文字] -> 文字
-    text = re.sub(r"\[connect:(.*?)\]", r"\1", text)
+    is_new = (markup_version == "26071300") or (not markup_version and "\x01" in text)
+    if is_new:
+        # \x01[replace:原文\x01|替换词\x01] -> 替换词
+        text = re.sub(
+            r"\x01\[replace:([^\x01]+)\x01\|([^\x01]+)\x01\]", lambda m: f" {m.group(2)} ", text
+        )
+        # \x01[汉字\x01|拼音\x01] -> 拼音 (转大写)
+        text = re.sub(
+            r"\x01\[([^\x01]+)\x01\|([^\x01]+)\x01\]", lambda m: f" {m.group(2).upper()} ", text
+        )
+        # \x01[connect:文字\x01] -> 文字
+        text = re.sub(r"\x01\[connect:([^\x01\]]+)\x01\]", r"\1", text)
+    else:
+        # [replace:原文|替换词] -> 替换词
+        text = re.sub(
+            r"\[replace:([^|\]]+)\|([^\]]+)\]", lambda m: f" {m.group(2)} ", text
+        )
+        # [汉字|拼音] -> 拼音 (转大写以匹配模型训练时的格式)
+        text = re.sub(r"\[([^|\]]+)\|([^\]]+)\]", lambda m: f" {m.group(2).upper()} ", text)
+        # [connect:文字] -> 文字
+        text = re.sub(r"\[connect:(.*?)\]", r"\1", text)
     return text
 
 
-def clean_text_for_subtitles(text):
+def clean_text_for_subtitles(text, markup_version=None):
     """Clean markup tags from text, producing display-friendly subtitle text.
 
     Preserves the original (user-visible) text by resolving markup to the
@@ -153,12 +171,21 @@ def clean_text_for_subtitles(text):
     Returns:
         Cleaned text suitable for display in subtitles.
     """
-    # [replace:原文|替换词] -> 原文
-    text = re.sub(r"\[replace:([^|\]]+)\|([^\]]+)\]", r"\1", text)
-    # [汉字|拼音] -> 汉字
-    text = re.sub(r"\[([^|\]]+)\|([^\]]+)\]", r"\1", text)
-    # [connect:文字] -> 文字
-    text = re.sub(r"\[connect:(.*?)\]", r"\1", text)
+    is_new = (markup_version == "26071300") or (not markup_version and "\x01" in text)
+    if is_new:
+        # \x01[replace:原文\x01|替换词\x01] -> 原文
+        text = re.sub(r"\x01\[replace:([^\x01]+)\x01\|[^\x01]+\x01\]", r"\1", text)
+        # \x01[汉字\x01|拼音\x01] -> 汉字
+        text = re.sub(r"\x01\[([^\x01]+)\x01\|[^\x01]+\x01\]", r"\1", text)
+        # \x01[connect:文字\x01] -> 文字
+        text = re.sub(r"\x01\[connect:([^\x01\]]+)\x01\]", r"\1", text)
+    else:
+        # [replace:原文|替换词] -> 原文
+        text = re.sub(r"\[replace:([^|\]]+)\|([^\]]+)\]", r"\1", text)
+        # [汉字|拼音] -> 汉字
+        text = re.sub(r"\[([^|\]]+)\|([^\]]+)\]", r"\1", text)
+        # [connect:文字] -> 文字
+        text = re.sub(r"\[connect:(.*?)\]", r"\1", text)
     return text
 
 
@@ -422,6 +449,7 @@ def concatenate_audio_actions(
     layer_penalty_factor,
     position_temperature,
     class_temperature,
+    markup_version=None,
 ):
     """Synthesize text segment by segment, inserting silence for pauses.
 
@@ -462,8 +490,8 @@ def concatenate_audio_actions(
         action_type, val = action
 
         if action_type == "text":
-            synth_text = clean_text_for_synthesis(val)
-            sub_text = clean_text_for_subtitles(val)
+            synth_text = clean_text_for_synthesis(val, markup_version=markup_version)
+            sub_text = clean_text_for_subtitles(val, markup_version=markup_version)
 
             logger.info(f"Synthesizing segment {idx}: {synth_text[:60]}...")
 
@@ -715,6 +743,12 @@ def get_parser() -> argparse.ArgumentParser:
         default=80,
         help="Max character length per subtitle line (40 for shorter lines)",
     )
+    parser.add_argument(
+        "--markup_version",
+        type=str,
+        default=None,
+        help="Markup format version (e.g. '26071300')",
+    )
 
     return parser
 
@@ -755,7 +789,7 @@ def main():
         logger.info(f"   Language: {args.language}")
 
     # Parse markup into actions
-    actions = parse_text_actions(args.text)
+    actions = parse_text_actions(args.text, markup_version=args.markup_version)
     logger.info(f"   Parsed {len(actions)} action(s): {actions}")
 
     # Synthesize segment by segment
@@ -775,6 +809,7 @@ def main():
         layer_penalty_factor=args.layer_penalty_factor,
         position_temperature=args.position_temperature,
         class_temperature=args.class_temperature,
+        markup_version=args.markup_version,
     )
 
     # Save audio
