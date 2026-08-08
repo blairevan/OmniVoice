@@ -40,11 +40,13 @@ Usage:
 """
 
 import argparse
+from dataclasses import replace
 import json
 import logging
 import os
 import re
 import sys
+from pathlib import Path
 
 import librosa
 import numpy as np
@@ -52,7 +54,26 @@ import soundfile as sf
 import torch
 
 from omnivoice.models.omnivoice import OmniVoice
+from omnivoice.utils.audio import load_waveform
+from omnivoice.utils.audio_segment_regenerator import (
+    RegenerationOptions,
+    ReplacementRequest,
+    SubtitleItem,
+    load_subtitles,
+    parse_replacements,
+    regenerate_audio_segments,
+    resolve_cli_mode,
+    validate_regeneration_inputs,
+    validate_regeneration_paths,
+)
 from omnivoice.utils.common import get_best_device, str2bool
+from omnivoice.utils.connect_candidate_pipeline import (
+    ConnectRuntimeOptions,
+    FunASRAligner,
+    select_connect_waveform,
+)
+from omnivoice.utils.connect_markup import parse_connect_markup, split_connect_markup
+from omnivoice.utils.connect_waveform_processor import ConnectProcessingOptions
 
 
 logger = logging.getLogger(__name__)
@@ -450,6 +471,7 @@ def concatenate_audio_actions(
     position_temperature,
     class_temperature,
     markup_version=None,
+    connect_options=None,
 ):
     """Synthesize text segment by segment, inserting silence for pauses.
 
@@ -482,22 +504,60 @@ def concatenate_audio_actions(
         list of subtitle dicts.
     """
     sample_rate = model.sampling_rate
+    expanded_actions = []
+    for action_type, value in actions:
+        if action_type != "text":
+            expanded_actions.append((action_type, value))
+            continue
+        markup = parse_connect_markup(value, markup_version)
+        if markup.ranges:
+            expanded_actions.extend(("connect_text", item) for item in split_connect_markup(markup, max_char_len))
+        elif "[" in value:
+            forced_parts = split_connect_markup(markup, max_char_len)
+            if len(forced_parts) > 1:
+                expanded_actions.extend(("forced_text", item) for item in forced_parts)
+            else:
+                expanded_actions.append((action_type, value))
+        elif "[" not in value:
+            plain_parts = split_subtitle_item(
+                {"start": 0.0, "end": 1.0, "text": value},
+                max_char_len=max_char_len,
+            )
+            if len(plain_parts) > 1:
+                expanded_actions.extend(
+                    ("plain_text", item["text"])
+                    for item in plain_parts
+                )
+            else:
+                expanded_actions.append((action_type, value))
+        else:
+            expanded_actions.append((action_type, value))
     audio_chunks = []
     current_time = 0.0
     all_timestamps = []
 
-    for idx, action in enumerate(actions):
+    for idx, action in enumerate(expanded_actions):
         action_type, val = action
 
-        if action_type == "text":
-            synth_text = clean_text_for_synthesis(val, markup_version=markup_version)
-            sub_text = clean_text_for_subtitles(val, markup_version=markup_version)
+        if action_type in {"text", "plain_text", "forced_text", "connect_text"}:
+            markup = val if action_type in {"forced_text", "connect_text"} else parse_connect_markup(val, markup_version)
+            synth_text = markup.synthesis_text
+            sub_text = markup.subtitle_text
+            if (
+                connect_options is not None
+                and connect_options.max_forced_segment_tokens is not None
+                and len(synth_text) > connect_options.max_forced_segment_tokens
+            ):
+                raise ValueError(
+                    "forced segment exceeds configured token limit: "
+                    f"{len(synth_text)} > {connect_options.max_forced_segment_tokens}"
+                )
 
             logger.info(f"Synthesizing segment {idx}: {synth_text[:60]}...")
 
             # Generate audio for this segment (no postprocessing to avoid
             # padding that would interfere with concatenation)
-            audios = model.generate(
+            generation_kwargs = dict(
                 text=synth_text,
                 language=language,
                 ref_audio=voice,
@@ -511,16 +571,44 @@ def concatenate_audio_actions(
                 position_temperature=position_temperature,
                 class_temperature=class_temperature,
                 postprocess_output=False,
+                audio_chunk_duration=0.0,
+                audio_chunk_threshold=0.0,
+                pad_duration=0.0,
+                fade_duration=0.0,
             )
-
-            segment_audio = audios[0]
+            if markup.ranges:
+                runtime = connect_options or ConnectRuntimeOptions()
+                action_runtime = replace(
+                    runtime,
+                    speech_speed=speed,
+                    debug_dir=(
+                        str(Path(runtime.debug_dir) / f"action_{idx + 1:03d}" / "segment_001")
+                        if runtime.debug_dir
+                        else None
+                    ),
+                )
+                aligner = FunASRAligner(action_runtime.aligner_device, action_runtime.aligner_model)
+                segment_audio = select_connect_waveform(
+                    markup, sample_rate,
+                    lambda: model.generate(**generation_kwargs)[0],
+                    aligner, action_runtime,
+                    ConnectProcessingOptions(maximum_shorten_ms=action_runtime.maximum_shorten_ms)
+                    if action_runtime.processing == "conservative" else None,
+                ).waveform
+            else:
+                segment_audio = model.generate(**generation_kwargs)[0]
             duration = len(segment_audio) / sample_rate
 
-            # Build subtitle entries for this segment
+            # A connect candidate's final sample count is its only trustworthy
+            # subtitle duration. Do not re-split it by character proportions.
             if sub_text.strip():
-                seg_subtitles = split_subtitle_item(
-                    {"start": 0.0, "end": duration, "text": sub_text},
-                    max_char_len=max_char_len,
+                seg_subtitles = (
+                    [{"start": 0.0, "end": duration, "text": sub_text}]
+                    if markup.ranges or action_type in {"plain_text", "forced_text"}
+                    else split_subtitle_item(
+                        {"start": 0.0, "end": duration, "text": sub_text},
+                        max_char_len=max_char_len,
+                    )
                 )
                 for sub in seg_subtitles:
                     all_timestamps.append(
@@ -549,11 +637,13 @@ def concatenate_audio_actions(
 
     # Apply post-processing speed change (librosa time-stretch preserves pitch)
     if speed != 1.0:
+        original_frames = len(final_audio)
         final_audio = change_audio_speed(final_audio, speed)
         if all_timestamps:
+            actual_scale = len(final_audio) / original_frames
             for sub in all_timestamps:
-                sub["start"] = round(sub["start"] / speed, 3)
-                sub["end"] = round(sub["end"] / speed, 3)
+                sub["start"] = round(sub["start"] * actual_scale, 3)
+                sub["end"] = round(sub["end"] * actual_scale, 3)
 
     return final_audio, sample_rate, all_timestamps
 
@@ -582,7 +672,7 @@ def change_audio_speed(audio, speed):
 
 
 def save_audio(audio, sample_rate, output_path):
-    """Save audio to file, inferring format from extension.
+    """Save audio and return the actual published path.
 
     Supports WAV, FLAC, OGG (via soundfile) and MP3 (via pydub + ffmpeg).
 
@@ -616,6 +706,7 @@ def save_audio(audio, sample_rate, output_path):
             sf.write(output_path, audio, sample_rate)
     else:
         sf.write(output_path, audio, sample_rate)
+    return output_path
 
 
 # ---------------------------------------------------------------------------
@@ -626,7 +717,7 @@ def save_audio(audio, sample_rate, output_path):
 def get_parser() -> argparse.ArgumentParser:
     """Build argument parser for the advanced inference CLI."""
     parser = argparse.ArgumentParser(
-        description="OmniVoice advanced inference with text markup support",
+        description="OmniVoice markup inference and audio segment regeneration",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
@@ -635,7 +726,7 @@ def get_parser() -> argparse.ArgumentParser:
         "-t",
         "--text",
         type=str,
-        required=True,
+        default=None,
         help="Text to synthesize (supports [pause], [replace], [connect] markup)",
     )
     parser.add_argument(
@@ -657,6 +748,24 @@ def get_parser() -> argparse.ArgumentParser:
         type=float,
         default=1.0,
         help="Audio playback speed factor (e.g. 1.2 for faster, 0.8 for slower)",
+    )
+    parser.add_argument(
+        "--source_audio",
+        type=str,
+        default=None,
+        help="Read-only source audio for subtitle-aligned segment regeneration",
+    )
+    parser.add_argument(
+        "--source_subtitle",
+        type=str,
+        default=None,
+        help="Read-only source SRT or JSON subtitle for segment regeneration",
+    )
+    parser.add_argument(
+        "--regenerate_segments",
+        type=str,
+        default=None,
+        help="JSON array of [HH:MM:SS.mmm start, end, replacement text] items",
     )
 
     # --- Voice mode ---
@@ -749,8 +858,154 @@ def get_parser() -> argparse.ArgumentParser:
         default=None,
         help="Markup format version (e.g. '26071300')",
     )
+    parser.add_argument("--connect_candidates", type=int, default=3, help="Connect candidate count (1-5)")
+    parser.add_argument("--connect_processing", choices=("conservative", "off"), default="conservative", help="Connect waveform processing mode")
+    parser.add_argument("--connect_max_shorten_ms", type=float, default=120.0, help="Maximum shortening per connect boundary")
+    parser.add_argument("--connect_aligner_device", default="cpu", help="FunASR fa-zh device")
+    parser.add_argument("--connect_debug_dir", default=None, help="Persistent connect candidate evidence directory")
+    parser.add_argument("--connect_aligner_model", default="fa-zh", help="FunASR forced-alignment model")
+    parser.add_argument("--connect_max_gap_ms", type=float, default=None, help="Optional maximum aligned connect gap")
+    parser.add_argument("--connect_seed", type=int, default=None, help="Optional base seed for reproducible connect candidates")
+    parser.add_argument("--max_forced_segment_tokens", type=int, default=None, help="Optional maximum cleaned-token length per forced segment")
+    parser.add_argument("--boundary_silence", type=float, default=0.3, help="Silence added to both final output boundaries")
 
     return parser
+
+
+def _prepare_regeneration(
+    args: argparse.Namespace,
+) -> tuple[RegenerationOptions, list[ReplacementRequest]]:
+    """Parse and statically validate regeneration inputs before model loading."""
+    options = RegenerationOptions(
+        source_audio=args.source_audio,
+        source_subtitle=args.source_subtitle,
+        output_audio=args.output,
+        output_srt=args.srt,
+        output_json_subtitle=args.json_subtitle,
+        max_char_len=args.max_char_len,
+    )
+    requests = parse_replacements(args.regenerate_segments)
+    validate_regeneration_paths(options)
+    source_waveform, source_sample_rate = load_waveform(options.source_audio)
+    source_duration = source_waveform.shape[-1] / source_sample_rate
+    subtitles = load_subtitles(options.source_subtitle)
+    validate_regeneration_inputs(subtitles, requests, source_duration)
+    return options, requests
+
+
+def _split_replacement_subtitles(
+    text: str, duration: float, max_char_len: int
+) -> list[SubtitleItem]:
+    """Adapt the existing advanced CLI subtitle splitter to normalized items."""
+    markup = parse_connect_markup(text)
+    if markup.ranges:
+        return [SubtitleItem(0.0, duration, markup.subtitle_text)]
+    items = split_subtitle_item(
+        {"start": 0.0, "end": duration, "text": text},
+        max_char_len=max_char_len,
+    )
+    return [
+        SubtitleItem(item["start"], item["end"], item["text"]) for item in items
+    ]
+
+
+def _run_regeneration(
+    args: argparse.Namespace,
+    model: OmniVoice,
+    options: RegenerationOptions,
+    requests: list[ReplacementRequest],
+) -> None:
+    """Regenerate requested clips with the loaded OmniVoice model."""
+    replacement_index = 0
+
+    def generate_replacement_segment(text: str, output_path: str) -> None:
+        """Synthesize one independent replacement clip through the markup pipeline."""
+        nonlocal replacement_index
+        replacement_index += 1
+        actions = parse_text_actions(text, markup_version=args.markup_version)
+        audio, sample_rate, _ = concatenate_audio_actions(
+            actions=actions,
+            model=model,
+            voice=args.voice,
+            ref_text=args.ref_text,
+            instruct=args.instruct,
+            language=args.language,
+            speed=args.speed,
+            max_char_len=args.max_char_len,
+            num_step=args.num_step,
+            guidance_scale=args.guidance_scale,
+            denoise=args.denoise,
+            t_shift=args.t_shift,
+            layer_penalty_factor=args.layer_penalty_factor,
+            position_temperature=args.position_temperature,
+            class_temperature=args.class_temperature,
+            markup_version=args.markup_version,
+            connect_options=ConnectRuntimeOptions(
+                args.connect_candidates, args.connect_processing,
+                args.connect_aligner_device, args.connect_max_shorten_ms,
+                str(Path(args.connect_debug_dir) / f"replacement_{replacement_index:03d}")
+                if args.connect_debug_dir else None,
+                args.connect_aligner_model, args.connect_max_gap_ms, args.speed, args.connect_seed, args.max_forced_segment_tokens,
+            ),
+        )
+        sf.write(output_path, audio, sample_rate)
+
+    def clean_replacement_subtitle(text: str) -> str:
+        """Resolve markup to the user-visible replacement subtitle text."""
+        actions = parse_text_actions(text, markup_version=args.markup_version)
+        return "".join(
+            parse_connect_markup(value, args.markup_version).subtitle_text
+            for action_type, value in actions
+            if action_type == "text"
+        )
+
+    result = regenerate_audio_segments(
+        options=options,
+        requests=requests,
+        segment_generator=generate_replacement_segment,
+        subtitle_cleaner=clean_replacement_subtitle,
+        subtitle_splitter=_split_replacement_subtitles,
+    )
+    logger.info(
+        "Segment regeneration completed: %.3fs, %d subtitle item(s)",
+        result.total_seconds,
+        len(result.subtitles),
+    )
+
+
+def _validate_connect_debug_path(
+    debug_dir: str,
+    paths: tuple[str | None, ...],
+) -> None:
+    """Reject debug directories that collide with formal inputs or outputs."""
+    debug_path = Path(debug_dir).resolve()
+    if debug_path.exists():
+        raise ValueError(f"Connect debug directory already exists: {debug_dir}")
+    resolved_paths = {
+        Path(value).resolve()
+        for value in paths
+        if value
+    }
+    if debug_path in resolved_paths:
+        raise ValueError("Connect debug directory must not match an input or output path")
+
+
+def _resolve_model_token_limit(model: OmniVoice) -> int | None:
+    """Read a trustworthy text-token limit exposed by the loaded model."""
+    candidates = (
+        getattr(model, "tokenizer", None),
+        getattr(model, "text_tokenizer", None),
+        getattr(model, "processor", None),
+    )
+    for candidate in candidates:
+        config = getattr(candidate, "config", candidate)
+        value = getattr(config, "model_max_length", None)
+        if isinstance(value, int) and 0 < value < 1_000_000:
+            return value
+        value = getattr(config, "max_position_embeddings", None)
+        if isinstance(value, int) and 0 < value < 1_000_000:
+            return value
+    return None
 
 
 def main():
@@ -758,13 +1013,49 @@ def main():
     formatter = "%(asctime)s %(levelname)s [%(filename)s:%(lineno)d] %(message)s"
     logging.basicConfig(format=formatter, level=logging.INFO, force=True)
 
-    args = get_parser().parse_args()
+    parser = get_parser()
+    args = parser.parse_args()
+    if args.connect_debug_dir is None:
+        output_path = Path(args.output)
+        args.connect_debug_dir = str(
+            output_path.parent / f"{output_path.stem}_connect_debug"
+        )
+    try:
+        _validate_connect_debug_path(
+            args.connect_debug_dir,
+            (
+                args.output,
+                args.srt,
+                args.json_subtitle,
+                args.source_audio,
+                args.source_subtitle,
+            ),
+        )
+    except ValueError as error:
+        parser.error(str(error))
+    try:
+        mode = resolve_cli_mode(
+            args.text,
+            args.source_audio,
+            args.source_subtitle,
+            args.regenerate_segments,
+            args.srt,
+            args.json_subtitle,
+        )
+        regeneration_inputs = (
+            _prepare_regeneration(args) if mode == "regeneration" else None
+        )
+    except (OSError, ValueError) as error:
+        parser.error(str(error))
 
     device = args.device or get_best_device()
     logger.info(f"Loading OmniVoice from {args.model} on {device} ...")
     model = OmniVoice.from_pretrained(
         args.model, device_map=device, dtype=torch.float16
     )
+    model_token_limit = _resolve_model_token_limit(model)
+    if args.max_forced_segment_tokens is None and model_token_limit is not None:
+        args.max_forced_segment_tokens = model_token_limit
 
     # Auto-load ASR if voice cloning is requested without ref_text
     if args.voice and not args.ref_text:
@@ -778,8 +1069,8 @@ def main():
             )
             sys.exit(1)
 
-    logger.info(f"Starting synthesis...")
-    logger.info(f"   Text: {args.text}")
+    operation_name = "segment regeneration" if mode == "regeneration" else "synthesis"
+    logger.info("Starting %s...", operation_name)
     logger.info(f"   Speaker Voice: {args.voice or '(none)'}")
     if args.ref_text:
         logger.info(f"   Ref Text: {args.ref_text}")
@@ -787,6 +1078,19 @@ def main():
         logger.info(f"   Voice Design: {args.instruct}")
     if args.language:
         logger.info(f"   Language: {args.language}")
+
+    if mode == "regeneration":
+        if regeneration_inputs is None:
+            raise RuntimeError("Regeneration inputs were not prepared")
+        options, requests = regeneration_inputs
+        try:
+            _run_regeneration(args, model, options, requests)
+        except (OSError, RuntimeError, ValueError) as error:
+            logger.error("Segment regeneration failed: %s", error)
+            sys.exit(1)
+        return
+
+    logger.info(f"   Text: {args.text}")
 
     # Parse markup into actions
     actions = parse_text_actions(args.text, markup_version=args.markup_version)
@@ -810,11 +1114,25 @@ def main():
         position_temperature=args.position_temperature,
         class_temperature=args.class_temperature,
         markup_version=args.markup_version,
+        connect_options=ConnectRuntimeOptions(args.connect_candidates, args.connect_processing, args.connect_aligner_device, args.connect_max_shorten_ms, args.connect_debug_dir, args.connect_aligner_model, args.connect_max_gap_ms, args.speed, args.connect_seed, args.max_forced_segment_tokens),
     )
 
+    if args.boundary_silence < 0:
+        parser.error("--boundary_silence must not be negative")
+    if args.boundary_silence > 0:
+        padding = np.zeros(round(args.boundary_silence * sample_rate), dtype=np.float32)
+        audio = np.concatenate((padding, audio, padding))
+        for timestamp in timestamps:
+            timestamp["start"] = round(timestamp["start"] + args.boundary_silence, 3)
+            timestamp["end"] = round(timestamp["end"] + args.boundary_silence, 3)
+
     # Save audio
-    save_audio(audio, sample_rate, args.output)
-    logger.info(f"Audio saved to: {args.output}")
+    actual_output = save_audio(audio, sample_rate, args.output)
+    final_waveform, final_sample_rate = load_waveform(actual_output)
+    final_duration = final_waveform.shape[-1] / final_sample_rate
+    if timestamps and timestamps[-1]["end"] > final_duration + 0.01:
+        parser.error("Final subtitle timeline exceeds encoded audio duration")
+    logger.info(f"Audio saved to: {actual_output}")
 
     # Generate SRT subtitles
     need_subtitles = bool(args.srt or args.json_subtitle)
@@ -835,10 +1153,10 @@ def main():
             logger.info(f"SRT subtitle saved to: {args.srt}")
 
         if args.json_subtitle:
-            total_seconds = round(len(audio) / sample_rate, 2)
+            total_seconds = round(final_duration, 2)
             json_data = {
-                "audio_file": os.path.basename(args.output),
-                "sample_rate": sample_rate,
+                "audio_file": os.path.basename(actual_output),
+                "sample_rate": final_sample_rate,
                 "total_seconds": total_seconds,
                 "sentences": timestamps,
             }

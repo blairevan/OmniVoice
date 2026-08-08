@@ -246,12 +246,13 @@ audio = model.generate(text="He plays the [B EY1 S] guitar while catching a [B A
 
 ## Command-Line Tools
 
-Three CLI entry points are provided. The CLI tools support all features available in the Python API (voice cloning, voice design, auto voice, generation parameters, etc.) — all controlled via command-line arguments.
+Four CLI entry points are provided. The CLI tools support all features available in the Python API (voice cloning, voice design, auto voice, generation parameters, etc.) — all controlled via command-line arguments.
 
 | Command | Description | Source |
 |---|---|---|
 | `omnivoice-demo` | Interactive Gradio web demo | [omnivoice/cli/demo.py](omnivoice/cli/demo.py) |
 | `omnivoice-infer` | Single-item inference | [omnivoice/cli/infer.py](omnivoice/cli/infer.py) |
+| `omnivoice-infer-advanced` | Markup synthesis and subtitle-aligned segment regeneration | [omnivoice/cli/cli_infer.py](omnivoice/cli/cli_infer.py) |
 | `omnivoice-infer-batch` | Batch inference across multiple GPUs | [omnivoice/cli/infer_batch.py](omnivoice/cli/infer_batch.py) |
 
 ### Demo
@@ -286,6 +287,38 @@ omnivoice-infer \
     --text "This is a test for text to speech."\
     --output hello.wav
 ```
+
+### Subtitle-Aligned Segment Regeneration
+
+`omnivoice-infer-advanced` can replace one or more complete subtitle ranges
+without synthesizing the rest of an existing recording again. Each replacement
+uses its naturally generated duration; later subtitles are shifted by the
+cumulative duration difference.
+
+```bash
+omnivoice-infer-advanced \
+    --model k2-fsa/OmniVoice \
+    --source_audio original.wav \
+    --source_subtitle original.srt \
+    --regenerate_segments '[["00:00:04.509","00:00:06.655","第一，具有相同的度；"],["00:00:19.537","00:00:21.899","结果还是 n 度关系，"]]' \
+    --voice speaker.wav \
+    --ref_text "Reference transcript." \
+    --output repaired.wav \
+    --srt repaired.srt \
+    --json_subtitle repaired.json
+```
+
+Replacement timestamps must use `HH:MM:SS.mmm`, be ordered and non-overlapping,
+and align with complete source subtitle boundaries within 10 ms. The source
+audio and subtitle are read-only. Output paths must be distinct from all inputs
+and must not already exist. WAV, FLAC, OGG, and MP3 output are supported; MP3 is
+decoded and re-encoded rather than cut at compressed-frame boundaries.
+
+The replacement text supports the same `[pause]`, `[replace]`, pronunciation,
+and `[connect]` markup as normal advanced inference. At least one rebuilt
+subtitle output (`--srt` or `--json_subtitle`) is required.
+
+For Chinese `[connect:...]`, see [conservative waveform processing](docs/connect_conservative_waveform_processing_zh.md). It uses three candidates and optional FunASR alignment; install it with `uv sync --extra connect`. `--connect_seed` makes candidate derivation reproducible, `--connect_debug_dir` writes alignment/quality evidence, and `--max_forced_segment_tokens` provides an explicit model-safe segment limit.
 
 ### Batch Inference
 
