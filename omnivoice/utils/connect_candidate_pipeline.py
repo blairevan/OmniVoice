@@ -3,7 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 import hashlib
+import logging
 import math
+import os
 from typing import Callable
 import tempfile
 from contextlib import nullcontext
@@ -14,6 +16,9 @@ import librosa
 from omnivoice.utils.connect_markup import ForcedSegment
 from omnivoice.utils.connect_candidate_selector import CharacterTimestamp, validate_alignment, internal_boundaries, CandidateScore
 from omnivoice.utils.connect_waveform_processor import ConnectProcessingOptions, measure_low_energy_pauses, process_connect_waveform
+
+
+logger = logging.getLogger(__name__)
 
 Aligner = Callable[[str, str], tuple[CharacterTimestamp, ...]]
 Generator = Callable[[], np.ndarray]
@@ -40,6 +45,41 @@ class WaveformSelection:
     version: str
     removed_samples: int
 
+
+def _resolve_local_funasr_model_path(model_name: str, model_revision: str = "v2.0.4") -> str:
+    """Resolve and validate a local FunASR model directory without network fallback."""
+    requested_path = Path(model_name).expanduser()
+    if model_name == "fa-zh":
+        cache_root = Path(
+            os.environ.get("MODELSCOPE_CACHE", str(Path.home() / ".cache" / "modelscope"))
+        )
+        requested_path = (
+            cache_root
+            / "models"
+            / "iic--speech_timestamp_prediction-v1-16k-offline"
+            / "snapshots"
+            / model_revision
+        )
+    if not requested_path.is_dir():
+        raise RuntimeError(
+            "FunASR local model is missing: "
+            f"{requested_path}. Download iic/speech_timestamp_prediction-v1-16k-offline "
+            f"revision {model_revision} manually on a connected machine, copy the complete "
+            "snapshot to this path, and retry. Runtime download is disabled."
+        )
+    config_files = ("configuration.json", "config.yaml", "config.yml")
+    if not any((requested_path / name).is_file() for name in config_files):
+        raise RuntimeError(
+            f"FunASR local model is incomplete: {requested_path} has no model configuration. "
+            "Copy the complete snapshot manually and retry. Runtime download is disabled."
+        )
+    if not (requested_path / "model.pt").is_file():
+        raise RuntimeError(
+            f"FunASR local model is incomplete: {requested_path}/model.pt is missing. "
+            "Copy the complete snapshot manually and retry. Runtime download is disabled."
+        )
+    return str(requested_path)
+
 class FunASRAligner:
     """Lazily load fa-zh only when a connect action needs alignment."""
     def __init__(self, device: str, model: str = "fa-zh") -> None: self._device, self._model_name, self._model = device, model, None
@@ -49,8 +89,15 @@ class FunASRAligner:
                 from funasr import AutoModel
             except ImportError as error:
                 raise RuntimeError("connect requires FunASR; install omnivoice[connect]") from error
+            local_model_path = _resolve_local_funasr_model_path(self._model_name)
+            logger.info(
+                "[connect] using local FunASR model path=%s model=%s",
+                local_model_path,
+                self._model_name,
+            )
             self._model = AutoModel(
-                model=self._model_name,
+                model=local_model_path,
+                model_path=local_model_path,
                 model_revision="v2.0.4",
                 device=self._device,
                 disable_update=True,
@@ -128,6 +175,15 @@ def select_connect_waveform(markup: ForcedSegment, sample_rate: int, generate: G
         raise ValueError("max forced segment tokens must be positive")
     if options.max_forced_segment_tokens is not None and len(markup.synthesis_text) > options.max_forced_segment_tokens:
         raise ValueError("forced segment exceeds configured token limit")
+    logger.info(
+        "[connect] candidate selection started candidates=%d processing=%s "
+        "aligner_model=%s speech_speed=%.3f text_length=%d",
+        options.candidates,
+        options.processing,
+        options.aligner_model,
+        options.speech_speed,
+        len(markup.synthesis_text),
+    )
     generated_waveforms: dict[int, np.ndarray] = {}
     generation_errors: dict[int, str] = {}
     for index in range(1, options.candidates + 1):
@@ -152,6 +208,18 @@ def select_connect_waveform(markup: ForcedSegment, sample_rate: int, generate: G
             generation_errors[index] = str(error)
     if not generated_waveforms:
         raise RuntimeError("connect generated no valid candidate waveform")
+    logger.info(
+        "[connect] candidate generation completed requested=%d succeeded=%d failed=%d",
+        options.candidates,
+        len(generated_waveforms),
+        len(generation_errors),
+    )
+    for index, error in sorted(generation_errors.items()):
+        logger.warning(
+            "[connect] candidate generation failed candidate=%d error=%s",
+            index,
+            error,
+        )
     original_durations = [waveform.shape[-1] / sample_rate for waveform in generated_waveforms.values()]
     original_rms = [20.0 * np.log10(max(float(np.sqrt(np.mean(np.square(waveform)))), 1e-12)) for waveform in generated_waveforms.values()]
     duration_median = float(np.median(original_durations))
@@ -311,7 +379,40 @@ def select_connect_waveform(markup: ForcedSegment, sample_rate: int, generate: G
     versions = accepted_versions
     if not versions:
         raise RuntimeError("connect has no acceptable candidate after audio quality validation")
+    for report in candidate_reports:
+        logger.info(
+            "[connect] candidate evaluation candidate=%d accepted=%s "
+            "accepted_original=%s processed_accepted=%s "
+            "original_max_gap_ms=%s processed_max_gap_ms=%s "
+            "original_total_gap_ms=%s processed_total_gap_ms=%s "
+            "rejections=%s processed_rejections=%s",
+            report.get("candidateIndex"),
+            report.get("accepted", False),
+            report.get("acceptedOriginal", False),
+            report.get("processedAccepted", False),
+            report.get("originalMaxGapMs"),
+            report.get("processedMaxGapMs"),
+            report.get("originalTotalGapMs"),
+            report.get("processedTotalGapMs"),
+            json.dumps(report.get("rejections", []), ensure_ascii=False),
+            json.dumps(report.get("processedRejections", []), ensure_ascii=False),
+        )
     score, waveform, removed = min(versions, key=lambda item: item[0].key())
+    logger.info(
+        "[connect] candidate selected candidate=%d version=%s "
+        "removed_samples=%d removed_ms=%.3f max_pause_ms=%.3f "
+        "total_pause_ms=%.3f max_gap_ms=%.3f total_gap_ms=%.3f "
+        "accepted_versions=%d",
+        score.candidate_index,
+        score.version,
+        removed,
+        removed * 1000.0 / sample_rate,
+        score.max_pause_ms,
+        score.total_pause_ms,
+        score.max_gap_ms,
+        score.total_gap_ms,
+        len(versions),
+    )
     if options.debug_dir is not None:
         (Path(options.debug_dir) / "selection.json").write_text(
             json.dumps({

@@ -30,7 +30,8 @@ class ReplacementRequest:
 
     start: float
     end: float
-    text: str
+    text: str | list[str]
+    speech_speed: float = 1.0
 
 
 SubtitleSplitter = Callable[[str, float, int], list[SubtitleItem]]
@@ -58,8 +59,13 @@ def _parse_srt_timestamp(value: str) -> float:
     return hours * 3600 + minutes * 60 + seconds + milliseconds / 1000
 
 
-def parse_replacements(value: str) -> list[ReplacementRequest]:
-    """Parse a JSON array of ``[start, end, text]`` replacement triples."""
+def parse_replacements(
+    value: str,
+    legacy_speed: float = 1.0,
+) -> list[ReplacementRequest]:
+    """Parse IndexTTS replacement quadruples with legacy triple support."""
+    if not math.isfinite(legacy_speed) or legacy_speed <= 0:
+        raise ValueError("Legacy replacement speed must be positive and finite")
     try:
         payload = json.loads(value)
     except json.JSONDecodeError as error:
@@ -69,22 +75,120 @@ def parse_replacements(value: str) -> list[ReplacementRequest]:
 
     requests: list[ReplacementRequest] = []
     for index, item in enumerate(payload, 1):
-        if not isinstance(item, list) or len(item) != 3:
-            raise ValueError(f"Replacement #{index} must contain exactly three values")
-        start_value, end_value, text_value = item
-        if not all(isinstance(part, str) for part in item):
-            raise ValueError(f"Replacement #{index} values must all be strings")
-        text = text_value.strip()
-        if not text:
-            raise ValueError(f"Replacement #{index} text must not be blank")
+        if not isinstance(item, list) or len(item) not in (3, 4):
+            raise ValueError(
+                f"Replacement #{index} must contain three legacy or four IndexTTS values"
+            )
+        start_value, end_value, text_value = item[:3]
+        if not isinstance(start_value, str) or not isinstance(end_value, str):
+            raise ValueError(f"Replacement #{index} start and end must be strings")
+        if isinstance(text_value, str):
+            text: str | list[str] = text_value.strip()
+            if not text:
+                raise ValueError(f"Replacement #{index} text must not be blank")
+        elif isinstance(text_value, list) and text_value and all(
+            isinstance(part, str) and part.strip() for part in text_value
+        ):
+            text = [part.strip() for part in text_value]
+        else:
+            raise ValueError(f"Replacement #{index} text must be a string or non-empty string array")
+        speech_speed = legacy_speed
+        if len(item) == 4:
+            raw_speed = item[3]
+            if isinstance(raw_speed, bool) or not isinstance(raw_speed, (int, float)):
+                raise ValueError(f"Replacement #{index} speechSpeed must be numeric")
+            speech_speed = float(raw_speed)
+            if not math.isfinite(speech_speed) or speech_speed <= 0:
+                raise ValueError(f"Replacement #{index} speechSpeed must be positive and finite")
         requests.append(
             ReplacementRequest(
                 start=parse_cli_timestamp(start_value),
                 end=parse_cli_timestamp(end_value),
                 text=text,
+                speech_speed=speech_speed,
             )
         )
     return requests
+
+
+def _covered_subtitle_indexes(
+    subtitles: Sequence[SubtitleItem],
+    request: ReplacementRequest,
+) -> list[int]:
+    """Return source subtitle indexes touched by a replacement range."""
+    return [
+        index
+        for index, item in enumerate(subtitles)
+        if item.end > request.start + BOUNDARY_TOLERANCE_SECONDS
+        and item.start < request.end - BOUNDARY_TOLERANCE_SECONDS
+    ]
+
+
+def _text_items_for_request(
+    subtitles: Sequence[SubtitleItem],
+    request: ReplacementRequest,
+) -> list[str]:
+    """Normalize one request's text to one display item per covered subtitle."""
+    covered = _covered_subtitle_indexes(subtitles, request)
+    if not covered:
+        raise ValueError("Replacement request does not cover any subtitle")
+    if isinstance(request.text, list):
+        if len(request.text) != len(covered):
+            raise ValueError("Replacement text array must match covered subtitle count")
+        return request.text
+    if len(covered) == 1:
+        return [request.text]
+    pieces = [
+        part.strip()
+        for part in re.findall(r".*?(?:[。！？!?；;]|$)", request.text, re.S)
+        if part.strip()
+    ]
+    if len(pieces) != len(covered):
+        raise ValueError("Multi-subtitle replacement text must provide one sentence per subtitle")
+    return pieces
+
+
+def normalize_replacement_requests(
+    subtitles: Sequence[SubtitleItem],
+    requests: Sequence[ReplacementRequest],
+) -> list[ReplacementRequest]:
+    """Merge adjacent complete requests with identical per-request speed."""
+    validate_subtitles(subtitles)
+    if not requests:
+        raise ValueError("Replacement array must contain at least one item")
+
+    normalized: list[ReplacementRequest] = []
+    for request in requests:
+        text_items = _text_items_for_request(subtitles, request)
+        current = ReplacementRequest(
+            request.start,
+            request.end,
+            text_items if len(text_items) > 1 else text_items[0],
+            request.speech_speed,
+        )
+        if normalized:
+            previous = normalized[-1]
+            previous_indexes = _covered_subtitle_indexes(subtitles, previous)
+            current_indexes = _covered_subtitle_indexes(subtitles, current)
+            if (
+                previous_indexes
+                and current_indexes
+                and previous_indexes[-1] + 1 == current_indexes[0]
+                and math.isclose(previous.end, current.start, abs_tol=BOUNDARY_TOLERANCE_SECONDS)
+            ):
+                if not math.isclose(previous.speech_speed, current.speech_speed):
+                    raise ValueError("Adjacent replacement requests must use the same speech speed")
+                previous_items = _text_items_for_request(subtitles, previous)
+                merged_items = previous_items + text_items
+                normalized[-1] = ReplacementRequest(
+                    previous.start,
+                    current.end,
+                    merged_items,
+                    previous.speech_speed,
+                )
+                continue
+        normalized.append(current)
+    return normalized
 
 
 def load_subtitles(path: str) -> list[SubtitleItem]:
@@ -185,8 +289,14 @@ def validate_regeneration_inputs(
             raise ValueError(f"Replacement #{index} times must be finite")
         if request.start < 0 or request.start >= request.end:
             raise ValueError(f"Replacement #{index} must satisfy 0 <= start < end")
-        if not request.text.strip():
+        if isinstance(request.text, str):
+            has_text = bool(request.text.strip())
+        else:
+            has_text = bool(request.text) and all(item.strip() for item in request.text)
+        if not has_text:
             raise ValueError(f"Replacement #{index} text must not be blank")
+        if not math.isfinite(request.speech_speed) or request.speech_speed <= 0:
+            raise ValueError(f"Replacement #{index} speech speed must be positive and finite")
         if request.end > source_duration + tolerance:
             raise ValueError(f"Replacement #{index} exceeds source audio duration")
         if request.start < previous_end:
@@ -222,16 +332,21 @@ def rebuild_subtitle_timeline(
     display_texts: Sequence[str],
     subtitle_splitter: SubtitleSplitter,
     max_char_len: int,
+    overlap_durations: Sequence[tuple[float, float]] | None = None,
 ) -> list[SubtitleItem]:
     """Replace covered subtitles and shift later items by cumulative deltas."""
     if not (len(requests) == len(generated_durations) == len(display_texts)):
         raise ValueError("Replacement metadata lengths must match")
+    if overlap_durations is None:
+        overlap_durations = [(0.0, 0.0)] * len(requests)
+    if len(overlap_durations) != len(requests):
+        raise ValueError("Replacement overlap metadata lengths must match")
 
     result: list[SubtitleItem] = []
     subtitle_index = 0
     cumulative_offset = 0.0
-    for request, duration, display_text in zip(
-        requests, generated_durations, display_texts
+    for request, duration, display_text, (left_overlap, right_overlap) in zip(
+        requests, generated_durations, display_texts, overlap_durations
     ):
         while (
             subtitle_index < len(subtitles)
@@ -253,8 +368,11 @@ def rebuild_subtitle_timeline(
         ):
             subtitle_index += 1
 
+        effective_duration = duration - left_overlap - right_overlap
+        if effective_duration <= 0:
+            raise ValueError("Replacement overlaps consume the generated subtitle window")
         replacement_start = request.start + cumulative_offset
-        for item in subtitle_splitter(display_text, duration, max_char_len):
+        for item in subtitle_splitter(display_text, effective_duration, max_char_len):
             result.append(
                 SubtitleItem(
                     replacement_start + item.start,
@@ -262,7 +380,7 @@ def rebuild_subtitle_timeline(
                     item.text,
                 )
             )
-        cumulative_offset += duration - (request.end - request.start)
+        cumulative_offset += effective_duration - (request.end - request.start)
 
     for item in subtitles[subtitle_index:]:
         result.append(

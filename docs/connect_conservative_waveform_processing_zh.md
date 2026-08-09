@@ -20,4 +20,4 @@ omnivoice-infer-advanced --text '[connect:课程门户首页]副屏组件。' \
 
 可用的稳定性与诊断参数包括：`--connect_candidates 1-5`、`--connect_seed`、`--connect_max_gap_ms`、`--connect_debug_dir`、`--connect_aligner_model`，以及显式的 `--max_forced_segment_tokens`。调试目录必须不存在，程序会写入 `candidate_NNN` 的原始/处理波形、对齐结果、编辑记录、候选拒绝原因和最终 `selection.json`；候选失败不会中止其它候选。未显式配置 token 上限时不会伪造模型限制。
 
-普通完整输出默认在最终编码前后边界各增加 `0.3s` 静音并同步字幕；源音频局部替换固定不增加边界静音。MP3 编码不可用时会发布同名 WAV，并在 JSON 元数据中使用实际发布路径。
+普通完整输出默认在最终编码前后边界各增加 `300ms` 静音并同步字幕；源音频局部替换固定不增加边界静音。`active_start_seconds` 从实际生成波形动态测量，不使用固定值。MP3 编码不可用时会发布同名 WAV，并在 JSON 元数据中使用实际发布路径。

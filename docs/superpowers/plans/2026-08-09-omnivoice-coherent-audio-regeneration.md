@@ -4,21 +4,23 @@
 
 **Goal:** Bring OmniVoice normal synthesis and subtitle-aligned regeneration to parity with the approved IndexTTS coherence design, including coherent sentence groups, shared offline WhisperX alignment, natural-duration timelines, and 15ms overlap-add splicing.
 
-**Architecture:** Keep OmniVoice markup and FunASR `connect` processing as the model-specific adapter. Add pure timeline/grouping and sentence-timing modules, a subprocess-based WhisperX adapter for the shared `/opt/app/aining/digital_human/whisperx` runtime, and a sample-index splicer. TTS generation runs to completion first; the TTS model is then moved off GPU and only afterward are all multi-sentence groups aligned with WhisperX CUDA.
+**Architecture:** Keep OmniVoice markup and FunASR `connect` processing as the model-specific adapter. Add pure timeline/grouping, sentence timing, GPU lifecycle, and synthesis-orchestration modules, a subprocess-based WhisperX adapter for the shared `/opt/app/aining/digital_human/whisperx` runtime, and a sample-index splicer. TTS generation runs to completion first; the TTS model is then moved off GPU and only afterward are all multi-sentence groups aligned with WhisperX CUDA under one task-wide deadline.
 
 **Tech Stack:** Python 3.10+, NumPy, Torch, SoundFile, Librosa, pydub, `unittest`, `uv`, shared WhisperX 3.7.4 runtime.
 
 ## Global Constraints
 
 - Do not add WhisperX to OmniVoice's default dependencies; invoke `/opt/app/aining/digital_human/whisperx` with `uv run --project`.
-- WhisperX uses local model files, `HF_HUB_OFFLINE=1`, `TRANSFORMERS_OFFLINE=1`, CUDA only, and a 10800-second timeout.
-- WhisperX alignment coverage uses the approved 95% threshold; small missing units may be monotonically interpolated, but a sentence with no reliable unit forces whole-group fallback.
-- WhisperX CUDA OOM, timeout, or process failure falls back to pronunciation-weight subtitle timing and never retries on CPU.
+- WhisperX defaults are runtime `/opt/app/aining/digital_human/whisperx`, model `/opt/app/aining/digital_human/whisperx/models/zh`, language `zh`, and device `cuda`; use local model files, `HF_HUB_OFFLINE=1`, and `TRANSFORMERS_OFFLINE=1`.
+- The 10800-second WhisperX timeout is a task-wide monotonic deadline. Every subprocess receives only the remaining task time; once exhausted, all pending groups use subtitle timing fallback.
+- WhisperX alignment coverage uses the approved 95% threshold. Match normalized alignment units with a deterministic order-preserving sequence matcher that handles repeated characters; interpolate only missing runs bounded by reliable neighbors, and force whole-group fallback when any sentence has no reliable unit.
+- WhisperX CUDA OOM, timeout, process failure, or inability to release TTS GPU memory falls back to pronunciation-weight subtitle timing and never retries on CPU.
 - The formal regeneration request is `[start, end, text|string[], speechSpeed]`; accept the legacy three-item request only as an explicit compatibility parse.
-- Adjacent regeneration requests with identical speech conditions are normalized into one coherent group before TTS; incompatible adjacent conditions are rejected.
+- Adjacent regeneration requests are normalized into one coherent group only when their complete subtitle coverage is adjacent and their per-request `speechSpeed` values match. Voice, style, language, and model parameters are task-global immutable CLI values.
+- A regeneration request's `speechSpeed` applies exactly once as post-synthesis group-level time stretch. Do not pass it to `model.generate()`, and do not apply the global `--speed` a second time.
 - Internal timing uses integer sample indices; SRT/JSON conversion happens only at serialization.
 - Preserve current `connect` FunASR candidate selection and conservative waveform processing; do not use its internal boundaries as visible subtitle boundaries.
-- Preserve unrelated worktree changes and do not run destructive Git commands.
+- Preserve unrelated worktree changes and do not run destructive Git commands. Do not create commits unless the user explicitly requests them.
 - Pure tests and fake TTS do not count as GPU, codec, or listening acceptance.
 
 ---
@@ -31,12 +33,13 @@ Create the following focused modules:
 - `omnivoice/utils/sentence_timing.py`: WhisperX character-to-sentence mapping, 95% coverage, interpolation, and pronunciation-weight fallback.
 - `omnivoice/utils/whisperx_alignment.py`: shared-runtime subprocess adapter, offline environment, local model preflight, and timeout handling.
 - `omnivoice/utils/gpu_runtime.py`: explicit TTS model/audio-tokenizer release before WhisperX CUDA.
+- `omnivoice/utils/synthesis_orchestrator.py`: generated-group records, two-phase TTS/alignment flow, and final subtitle assembly.
 
 Modify these existing modules:
 
 - `omnivoice/utils/segment_timeline.py`: four-item request parsing, speech speed, adjacent-group normalization, and integer-sample subtitle validation.
 - `omnivoice/utils/audio_segment_regenerator.py`: all-group generation, 15ms overlap-add, sentence timing, group metadata, and safe publication.
-- `omnivoice/cli/cli_infer.py`: two-phase normal synthesis, two-phase regeneration callbacks, WhisperX CLI options, and final boundary-silence behavior.
+- `omnivoice/cli/cli_infer.py`: CLI options, argument validation, thin invocation of the orchestrator, and final boundary-silence behavior.
 - `omnivoice/utils/connect_markup.py`: expose the exact mappings needed by coherent groups without changing current markup semantics.
 - `tests/test_audio_segment_regenerator.py`: update existing contracts and add multi-group/overlap tests.
 - `tests/test_connect_cli_integration.py`: preserve connect and normal CLI contracts while adding coherent-group assertions.
@@ -100,7 +103,7 @@ Update documentation:
 **Interfaces:**
 - `ReplacementRequest(start: float, end: float, text: str | list[str], speech_speed: float)`.
 - `parse_replacements(value: str, legacy_speed: float | None = None) -> list[ReplacementRequest]`.
-- `normalize_replacement_requests(subtitles, requests, global_defaults) -> list[ReplacementRequest]`.
+- `normalize_replacement_requests(subtitles, requests) -> list[ReplacementRequest]`.
 
 - [ ] **Step 1: Add failing protocol tests**
 
@@ -108,7 +111,7 @@ Update documentation:
 
 - [ ] **Step 2: Add failing adjacency tests**
 
-  Create three ordered subtitles and assert that adjacent requests with identical speed and generation conditions normalize into one request with a text array; non-adjacent requests remain separate; adjacent requests with different speed are rejected.
+  Create three ordered subtitles and assert that adjacent requests with identical `speechSpeed` normalize into one request with a text array; non-adjacent requests remain separate; adjacent requests with different speed are rejected. Voice/style/language are task-global and therefore are not compared per request.
 
 - [ ] **Step 3: Run tests to verify failure**
 
@@ -118,7 +121,7 @@ Update documentation:
 
 - [ ] **Step 4: Implement strict parsing and normalization**
 
-  Keep strict `HH:MM:SS.mmm` parsing and complete subtitle-boundary validation. Preserve original request order for source-axis cutting. Use the request's `speech_speed` when generating a group; use the global speed only for legacy input. Merge only complete adjacent subtitle coverage with matching conditions.
+  Keep strict `HH:MM:SS.mmm` parsing and complete subtitle-boundary validation. Preserve original request order for source-axis cutting. Store the request's `speech_speed`; use the global speed only to populate legacy three-item input. Merge only complete adjacent subtitle coverage with equal `speech_speed`, preserving replacement texts in source order.
 
 - [ ] **Step 5: Run tests to verify success**
 
@@ -135,12 +138,13 @@ Update documentation:
 
 **Interfaces:**
 - `AlignedCharacter(character: str, start: float, end: float)`.
-- `WhisperXAligner(runtime_dir, language, device, model_name, timeout_seconds=10800)`.
-- `WhisperXAligner.align(audio_path, text, start, end) -> tuple[AlignedCharacter, ...]`.
+- `WhisperXAligner(runtime_dir, language, device, model_name)`.
+- `WhisperXAlignmentDeadline.from_timeout_seconds(10800) -> WhisperXAlignmentDeadline`.
+- `WhisperXAligner.align(audio_path, text, start, end, deadline) -> tuple[AlignedCharacter, ...]`.
 
 - [ ] **Step 1: Write failing adapter tests**
 
-  Mock `subprocess.run` and assert the exact command includes `uv run --project`, the shared `align.py`, local model path, language, CUDA device, interval, output path, and `timeout=10800`. Assert the subprocess environment contains both offline variables. Add tests for malformed JSON, missing `segments[0].chars`, non-zero exit, timeout, and missing local runtime/model paths.
+  Mock `time.monotonic` and `subprocess.run`. Assert the exact command includes `uv run --project`, the shared `align.py`, local model path, language, CUDA device, and interval; assert `timeout` equals the deadline's remaining seconds rather than a fresh 10800 seconds. Assert the subprocess environment contains both offline variables. Add tests for deadline exhaustion before spawning, malformed JSON, missing `segments[0].chars`, non-zero exit, timeout, and missing local runtime/model paths.
 
 - [ ] **Step 2: Run tests to verify failure**
 
@@ -150,11 +154,11 @@ Update documentation:
 
 - [ ] **Step 3: Implement the adapter**
 
-  Preflight `runtime_dir/pyproject.toml`, `runtime_dir/align.py`, and `model_name` before invoking `uv`. Pass an explicit environment copy with `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1`. Use `subprocess.run(..., check=True, capture_output=True, text=True, timeout=timeout_seconds)`. Convert timeout and process failures into typed alignment errors that the caller can record and downgrade. Parse only valid finite `char/start/end` entries and reject an output that does not have exactly one segment.
+  Preflight `runtime_dir/pyproject.toml`, `runtime_dir/align.py`, and `model_name` before invoking `uv`. Pass an explicit environment copy with `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1`. Before each child process, obtain the deadline's positive remaining seconds and use it as `subprocess.run(..., check=True, capture_output=True, text=True, timeout=remaining_seconds)`; if no time remains, raise a typed timeout error without spawning. Convert timeout and process failures into typed alignment errors that the caller records and downgrades. Parse only valid finite `char/start/end` entries and reject an output that does not have exactly one segment.
 
 - [ ] **Step 4: Add CLI options and lazy construction**
 
-  Add `--whisperx_runtime_dir`, `--whisperx_language`, `--whisperx_device` with only `cuda`, `--whisperx_model`, and `--whisperx_timeout_seconds` defaulting to `10800`. Construct the adapter only when SRT or JSON output is requested.
+  Add `--whisperx_runtime_dir` defaulting to `/opt/app/aining/digital_human/whisperx`, `--whisperx_language` defaulting to `zh`, `--whisperx_device` restricted to `cuda`, `--whisperx_model` defaulting to `/opt/app/aining/digital_human/whisperx/models/zh`, and `--whisperx_timeout_seconds` defaulting to `10800`. Construct the adapter and task deadline only when SRT or JSON output is requested and at least one multi-sentence group is pending.
 
 - [ ] **Step 5: Run tests to verify success**
 
@@ -186,7 +190,7 @@ Update documentation:
 
 - [ ] **Step 3: Implement strict character mapping and coverage**
 
-  Compare aligned characters against the normalized `alignment_text` sequence, compute `reliable_timed_units / total_alignable_units`, interpolate only small missing runs when the total is at least 0.95, and force whole-group fallback if any sentence has no reliable unit. Never mix a partially aligned sentence with weighted timing from another rule.
+  Tokenize both expected and returned values into normalized alignment units, then run a deterministic longest-common-subsequence-style order-preserving matcher that records each expected unit's optional aligned timestamp and works for repeated characters. Compute `reliable_timed_units / total_alignable_units`; interpolate only interior missing runs bounded by valid left/right timestamps when total coverage is at least 0.95. Force whole-group fallback if any sentence has no reliable unit or if the interpolated result is non-monotonic. Never mix a partially aligned sentence with weighted timing from another rule.
 
 - [ ] **Step 4: Implement weighted fallback**
 
@@ -206,12 +210,12 @@ Update documentation:
 - Modify: `omnivoice/cli/cli_infer.py`
 
 **Interfaces:**
-- `release_tts_gpu_runtime(model) -> None`.
-- `assert_cuda_runtime_released(model) -> None` for internal preflight diagnostics.
+- `release_tts_gpu_runtime(model, maximum_allocated_bytes=134217728) -> GpuReleaseResult`.
+- `GpuReleaseResult(released: bool, allocated_bytes_after: int, reason: str | None)`.
 
 - [ ] **Step 1: Write failing lifecycle tests**
 
-  Use fake model, audio tokenizer, and ASR components. Assert that model and tokenizer receive `.to("cpu")` or are deleted, `gc.collect()` is called, and `torch.cuda.empty_cache()` is called only after component release. Assert that a component release failure becomes a clear error before WhisperX starts.
+  Use fake model, audio tokenizer, and ASR components. Assert that model and tokenizer receive `.to("cpu")` or are deleted, `gc.collect()` is called, and `torch.cuda.empty_cache()` is called only after component release. Mock `torch.cuda.memory_allocated()` and assert that allocations above 134217728 bytes return `released=False`; assert component-release failure also returns `released=False` with a reason, without raising away already-generated audio.
 
 - [ ] **Step 2: Run tests to verify failure**
 
@@ -221,11 +225,11 @@ Update documentation:
 
 - [ ] **Step 3: Implement release and preflight**
 
-  Release `audio_tokenizer`, optional `_asr_pipe`, and the OmniVoice model in that order. Do not claim that `empty_cache()` alone releases model memory. Synchronize CUDA before release, run garbage collection afterward, and verify that no tracked TTS component still reports a CUDA device.
+  Release `audio_tokenizer`, optional `_asr_pipe`, and the OmniVoice model in that order. Do not claim that `empty_cache()` alone releases model memory. Synchronize CUDA before release, run garbage collection afterward, and inspect process-local `torch.cuda.memory_allocated()`. Return `released=True` only when tracked components no longer report CUDA and allocated memory is at most 134217728 bytes; otherwise return `released=False` with a diagnostic reason.
 
 - [ ] **Step 4: Integrate two-phase orchestration**
 
-  Change normal synthesis and regeneration to collect all generated group WAVs and mappings first. After the last TTS call, call `release_tts_gpu_runtime(model)`, then run all pending WhisperX alignments with CUDA. On WhisperX OOM/timeout/process error, retain generated audio and resolve only subtitle timing via weighted fallback. Do not restore the TTS model in the same task.
+  Change normal synthesis and regeneration to collect all generated group WAVs and mappings first. If no multi-sentence group needs alignment, skip GPU release entirely. Otherwise call `release_tts_gpu_runtime(model)` after the last TTS call. When it returns `released=False`, do not start WhisperX CUDA; record `tts_gpu_release_failed` for every pending group and resolve all of them with weighted timing. When it returns `released=True`, run pending WhisperX alignments with CUDA under the single task deadline. On WhisperX OOM/timeout/process error, retain generated audio and resolve only subtitle timing via weighted fallback. Do not restore the TTS model in the same task.
 
 - [ ] **Step 5: Run tests to verify success**
 
@@ -246,7 +250,7 @@ Update documentation:
 
 - [ ] **Step 1: Write failing splice tests**
 
-  Assert that two source/replacement boundaries use 15ms equal-power overlap, short pieces reduce overlap safely, output sample count equals piece sums minus actual overlaps, and source slices are taken from original sample positions even after earlier groups change duration.
+  Assert that two source/replacement boundaries use 15ms equal-power overlap with `fade_out**2 + fade_in**2 == 1` within floating-point tolerance, short pieces reduce overlap safely, output sample count equals piece sums minus actual overlaps, mixed samples are finite, and source slices are taken from original sample positions even after earlier groups change duration.
 
 - [ ] **Step 2: Run tests to verify failure**
 
@@ -275,18 +279,20 @@ Update documentation:
 ## Task 7: Integrate coherent normal synthesis and preserve connect behavior
 
 **Files:**
+- Create: `omnivoice/utils/synthesis_orchestrator.py`
 - Modify: `omnivoice/cli/cli_infer.py`
 - Modify: `omnivoice/utils/connect_markup.py`
 - Modify: `tests/test_connect_cli_integration.py`
 - Modify: `tests/test_connect_processing.py`
 
 **Interfaces:**
-- `generate_coherent_actions(...) -> GeneratedSynthesisResult`.
-- `resolve_generated_group_timings(...) -> tuple[SubtitleItem, ...]`.
+- `GeneratedSynthesisGroup(waveform, sample_rate, units, source_action_index, timing_request)`.
+- `generate_coherent_actions(...) -> tuple[GeneratedSynthesisGroup, ...]`.
+- `resolve_generated_group_timings(groups, alignment_session) -> tuple[SubtitleItem, ...]`.
 
 - [ ] **Step 1: Add failing integration tests**
 
-  With a fake OmniVoice model, assert that two adjacent subtitle units result in one model generation call, one connect group retains FunASR processing, single sentences skip WhisperX, and all WhisperX calls happen after the GPU release hook. Assert the final `boundary_silence` is applied once and shifts all normal-output subtitles equally.
+  With a fake OmniVoice model, assert that two adjacent subtitle units result in one model generation call, one connect group retains FunASR processing, single sentences skip WhisperX, and all WhisperX calls happen after the GPU release hook. Assert the final `leading_silence` and `trailing_silence` are applied once and shift normal-output subtitles equally only for the leading padding.
 
 - [ ] **Step 2: Run tests to verify failure**
 
@@ -296,11 +302,11 @@ Update documentation:
 
 - [ ] **Step 3: Implement normal-mode orchestration**
 
-  Replace the current per-expanded-action timestamp assignment with generated group records. Keep `pause` as an explicit audio action, preserve the existing connect candidate options, and pass merged connect markup to the existing selector. Generate all group audio first; then release the TTS runtime and resolve multi-sentence timings.
+  Put generated-group records and two-phase orchestration in `synthesis_orchestrator.py`; keep `cli_infer.py` as argument parsing and result publication only. Replace the current per-expanded-action timestamp assignment with generated group records. Keep `pause` as an explicit audio action, preserve the existing connect candidate options, and pass merged connect markup to the existing selector. Generate all group audio first; then conditionally release the TTS runtime and resolve multi-sentence timings.
 
 - [ ] **Step 4: Apply final boundary silence once**
 
-  Keep `boundary_silence` at the final normal-output stage only. Add the same sample offset to every generated subtitle timestamp, and never add it inside a replacement group.
+  Keep `leading_silence` and `trailing_silence` at the final normal-output stage only. Add the leading sample offset to every generated subtitle timestamp, and never add either padding inside a replacement group.
 
 - [ ] **Step 5: Run tests to verify success**
 
@@ -318,7 +324,7 @@ Update documentation:
 
 - [ ] **Step 1: Integrate request normalization and group generation**
 
-  Pass each normalized request's own `speech_speed` into `model.generate()`. For a text array, preserve one display/alignment unit per covered source subtitle. Generate every replacement group before the GPU release hook, then align all multi-sentence replacements through the shared adapter.
+  For each normalized request, call `model.generate()` without a speed override, then apply the request's `speech_speed` exactly once with the existing group-level time-stretch helper before reading its actual sample count. Pass the same speed to `ConnectRuntimeOptions` only for connect candidate evaluation. For a text array, preserve one display/alignment unit per covered source subtitle. Generate every replacement group before the GPU release hook, then align all multi-sentence replacements through the shared adapter.
 
 - [ ] **Step 2: Document the public CLI contract**
 
@@ -368,15 +374,14 @@ Update documentation:
     --whisperx_timeout_seconds 10800
   ```
 
-  Manually verify GPU memory is released before WhisperX starts, output audio is decodable, subtitles are aligned and monotonic, and the audio has no missing/repeated sentence. Run a separate local-range regeneration sample and compare the source hash before/after.
+  Manually record `torch.cuda.memory_allocated()` before TTS, after the TTS-release hook, and immediately before WhisperX starts; after release it must be at most 134217728 bytes or WhisperX must be skipped with `tts_gpu_release_failed`. Verify output audio is decodable, subtitles are aligned and monotonic, and the audio has no missing/repeated sentence. Run a separate local-range regeneration sample and compare the source hash before/after.
 
-- [ ] **Step 6: Commit implementation batches**
+- [ ] **Step 6: Preserve the clean commit boundary**
 
-  Use focused Conventional Commits after each independently passing task, for example:
+  Do not create commits as part of plan execution. Before editing, record `git status --short` and `git diff --stat`; after all verification, present the scoped diff to the user. Create a Conventional Commit only if the user explicitly requests it.
 
-  ```bash
-  git add omnivoice/utils/coherent_timeline.py tests/test_coherent_timeline.py
-  git commit -m "feat: add coherent synthesis timeline"
+  ```text
+  No automatic staging or commit is permitted by this plan.
   ```
 
-  Stage only files belonging to the completed task; do not stage unrelated existing worktree changes.
+  Never stage or commit files until the user explicitly asks for a commit.

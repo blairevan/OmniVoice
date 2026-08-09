@@ -45,8 +45,11 @@ import json
 import logging
 import os
 import re
+import shutil
 import sys
+import time
 from pathlib import Path
+from typing import Sequence
 
 import librosa
 import numpy as np
@@ -60,6 +63,7 @@ from omnivoice.utils.audio_segment_regenerator import (
     ReplacementRequest,
     SubtitleItem,
     load_subtitles,
+    normalize_replacement_requests,
     parse_replacements,
     regenerate_audio_segments,
     resolve_cli_mode,
@@ -74,6 +78,16 @@ from omnivoice.utils.connect_candidate_pipeline import (
 )
 from omnivoice.utils.connect_markup import parse_connect_markup, split_connect_markup
 from omnivoice.utils.connect_waveform_processor import ConnectProcessingOptions
+from omnivoice.utils.gpu_runtime import release_tts_gpu_runtime
+from omnivoice.utils.synthesis_orchestrator import (
+    generate_coherent_actions,
+    resolve_generated_group_timings,
+)
+from omnivoice.utils.sentence_timing import TimingResolution, resolve_sentence_timings
+from omnivoice.utils.whisperx_alignment import (
+    WhisperXAligner,
+    WhisperXAlignmentDeadline,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -648,6 +662,51 @@ def concatenate_audio_actions(
     return final_audio, sample_rate, all_timestamps
 
 
+def _detect_active_start_seconds(audio: np.ndarray, sample_rate: int) -> float:
+    """Estimate the first non-silent sample for automatic subtitle correction."""
+    if sample_rate <= 0 or audio.size == 0:
+        return 0.0
+    peak = float(np.max(np.abs(audio)))
+    if not np.isfinite(peak) or peak <= 0:
+        return 0.0
+    threshold = max(1e-5, peak * (10.0 ** (-50.0 / 20.0)))
+    active_samples = np.flatnonzero(np.abs(audio) > threshold)
+    return float(active_samples[0]) / sample_rate if active_samples.size else 0.0
+
+
+def _resolve_subtitle_offset(value: str, active_start_seconds: float) -> float:
+    """Resolve an IndexTTS-compatible subtitle offset in seconds."""
+    if value.strip().lower() == "auto":
+        return max(0.0, active_start_seconds)
+    try:
+        offset_ms = float(value)
+    except ValueError as error:
+        raise ValueError(
+            "--subtitle_offset must be auto or a finite millisecond value"
+        ) from error
+    if not np.isfinite(offset_ms):
+        raise ValueError("--subtitle_offset must be auto or a finite millisecond value")
+    return offset_ms / 1000.0
+
+
+def _apply_subtitle_offset(
+    timestamps: list[dict[str, object]],
+    offset_seconds: float,
+) -> None:
+    """Apply IndexTTS-compatible subtitle offset correction in place."""
+    if offset_seconds == 0.0:
+        return
+    for index, subtitle in enumerate(timestamps):
+        start = float(subtitle["start"])
+        end = float(subtitle["end"])
+        if index == 0:
+            subtitle["end"] = max(start, round(end - offset_seconds, 3))
+        else:
+            shifted_start = max(0.0, round(start - offset_seconds, 3))
+            subtitle["start"] = shifted_start
+            subtitle["end"] = max(shifted_start, round(end - offset_seconds, 3))
+
+
 def change_audio_speed(audio, speed):
     """Adjust audio playback speed using librosa time-stretch.
 
@@ -802,6 +861,12 @@ def get_parser() -> argparse.ArgumentParser:
         default=None,
         help="Device for inference (auto-detected if not specified)",
     )
+    parser.add_argument(
+        "--offline",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use only local HuggingFace/Transformers cache (default: enabled)",
+    )
 
     # --- Generation parameters ---
     parser.add_argument(
@@ -867,7 +932,14 @@ def get_parser() -> argparse.ArgumentParser:
     parser.add_argument("--connect_max_gap_ms", type=float, default=None, help="Optional maximum aligned connect gap")
     parser.add_argument("--connect_seed", type=int, default=None, help="Optional base seed for reproducible connect candidates")
     parser.add_argument("--max_forced_segment_tokens", type=int, default=None, help="Optional maximum cleaned-token length per forced segment")
-    parser.add_argument("--boundary_silence", type=float, default=0.3, help="Silence added to both final output boundaries")
+    parser.add_argument("--leading_silence", type=float, default=300.0, help="Silence in milliseconds added before normal output")
+    parser.add_argument("--trailing_silence", type=float, default=300.0, help="Silence in milliseconds added after normal output")
+    parser.add_argument("--subtitle_offset", type=str, default="auto", help="Subtitle offset in milliseconds, or auto")
+    parser.add_argument("--whisperx_runtime_dir", default="/opt/app/aining/digital_human/whisperx", help="Shared offline WhisperX runtime directory")
+    parser.add_argument("--whisperx_language", default="zh", help="WhisperX alignment language")
+    parser.add_argument("--whisperx_device", choices=("cuda",), default="cuda", help="WhisperX device")
+    parser.add_argument("--whisperx_model", default="/opt/app/aining/digital_human/whisperx/models/zh", help="Local WhisperX alignment model directory")
+    parser.add_argument("--whisperx_timeout_seconds", type=float, default=10800.0, help="Total WhisperX alignment deadline in seconds")
 
     return parser
 
@@ -884,11 +956,13 @@ def _prepare_regeneration(
         output_json_subtitle=args.json_subtitle,
         max_char_len=args.max_char_len,
     )
-    requests = parse_replacements(args.regenerate_segments)
+    requests = parse_replacements(args.regenerate_segments, legacy_speed=args.speed)
     validate_regeneration_paths(options)
     source_waveform, source_sample_rate = load_waveform(options.source_audio)
     source_duration = source_waveform.shape[-1] / source_sample_rate
     subtitles = load_subtitles(options.source_subtitle)
+    validate_regeneration_inputs(subtitles, requests, source_duration)
+    requests = normalize_replacement_requests(subtitles, requests)
     validate_regeneration_inputs(subtitles, requests, source_duration)
     return options, requests
 
@@ -917,21 +991,42 @@ def _run_regeneration(
 ) -> None:
     """Regenerate requested clips with the loaded OmniVoice model."""
     replacement_index = 0
+    alignment_requested = bool(args.srt or args.json_subtitle) and any(
+        isinstance(request.text, list) and len(request.text) > 1 for request in requests
+    )
+    alignment_state: dict[str, object] = {"enabled": alignment_requested}
+    whisperx_aligner = (
+        WhisperXAligner(
+            args.whisperx_runtime_dir,
+            args.whisperx_language,
+            args.whisperx_device,
+            args.whisperx_model,
+        )
+        if alignment_requested
+        else None
+    )
+    whisperx_deadline: WhisperXAlignmentDeadline | None = None
 
-    def generate_replacement_segment(text: str, output_path: str) -> None:
+    def generate_replacement_segment(request: ReplacementRequest, output_path: str) -> None:
         """Synthesize one independent replacement clip through the markup pipeline."""
         nonlocal replacement_index
         replacement_index += 1
+        text = "".join(request.text) if isinstance(request.text, list) else request.text
         actions = parse_text_actions(text, markup_version=args.markup_version)
-        audio, sample_rate, _ = concatenate_audio_actions(
+        max_tokens = (
+            args.max_forced_segment_tokens
+            or _resolve_model_token_limit(model)
+            or args.max_char_len * 3
+        )
+        generated = generate_coherent_actions(
             actions=actions,
             model=model,
             voice=args.voice,
             ref_text=args.ref_text,
             instruct=args.instruct,
             language=args.language,
-            speed=args.speed,
             max_char_len=args.max_char_len,
+            max_tokens=max_tokens,
             num_step=args.num_step,
             guidance_scale=args.guidance_scale,
             denoise=args.denoise,
@@ -945,10 +1040,11 @@ def _run_regeneration(
                 args.connect_aligner_device, args.connect_max_shorten_ms,
                 str(Path(args.connect_debug_dir) / f"replacement_{replacement_index:03d}")
                 if args.connect_debug_dir else None,
-                args.connect_aligner_model, args.connect_max_gap_ms, args.speed, args.connect_seed, args.max_forced_segment_tokens,
+                args.connect_aligner_model, args.connect_max_gap_ms, request.speech_speed, args.connect_seed, args.max_forced_segment_tokens,
             ),
         )
-        sf.write(output_path, audio, sample_rate)
+        audio = change_audio_speed(generated.waveform, request.speech_speed)
+        sf.write(output_path, audio, generated.sample_rate)
 
     def clean_replacement_subtitle(text: str) -> str:
         """Resolve markup to the user-visible replacement subtitle text."""
@@ -959,12 +1055,68 @@ def _run_regeneration(
             if action_type == "text"
         )
 
+    def clean_replacement_alignment_text(text: str) -> str:
+        """Resolve markup to the character layer used by WhisperX alignment."""
+        actions = parse_text_actions(text, markup_version=args.markup_version)
+        return "".join(
+            parse_connect_markup(value, args.markup_version).alignment_text
+            for action_type, value in actions
+            if action_type == "text"
+        )
+
+    def release_before_alignment() -> None:
+        """Release TTS GPU memory before starting any WhisperX process."""
+        nonlocal whisperx_deadline
+        if not alignment_requested:
+            return
+        result = release_tts_gpu_runtime(model)
+        alignment_state["enabled"] = result.released
+        if not result.released:
+            alignment_state["failure_reason"] = "tts_gpu_release_failed"
+        if result.released:
+            whisperx_deadline = WhisperXAlignmentDeadline.from_timeout_seconds(
+                args.whisperx_timeout_seconds
+            )
+        if not result.released:
+            logger.warning("Skipping WhisperX after TTS GPU release failure: %s", result.reason)
+
+    def resolve_replacement_alignment(
+        audio_path: str,
+        sentence_texts: Sequence[str],
+        generated_samples: int,
+        sample_rate: int,
+    ) -> TimingResolution:
+        """Resolve one replacement group's subtitle timing through WhisperX."""
+        if not alignment_state["enabled"] or whisperx_aligner is None or whisperx_deadline is None:
+            raise RuntimeError(
+                str(alignment_state.get("failure_reason", "whisperx_unavailable"))
+            )
+        characters = whisperx_aligner.align(
+            audio_path,
+            "".join(sentence_texts),
+            0.0,
+            generated_samples / sample_rate,
+            whisperx_deadline,
+        )
+        resolution = resolve_sentence_timings(
+            sentence_texts,
+            characters,
+            sample_rate,
+            generated_samples,
+            0,
+            0,
+        )
+        return resolution
+
     result = regenerate_audio_segments(
         options=options,
         requests=requests,
         segment_generator=generate_replacement_segment,
         subtitle_cleaner=clean_replacement_subtitle,
         subtitle_splitter=_split_replacement_subtitles,
+        alignment_resolver=resolve_replacement_alignment if alignment_requested else None,
+        alignment_text_resolver=clean_replacement_alignment_text,
+        before_alignment=release_before_alignment if alignment_requested else None,
     )
     logger.info(
         "Segment regeneration completed: %.3fs, %d subtitle item(s)",
@@ -979,8 +1131,6 @@ def _validate_connect_debug_path(
 ) -> None:
     """Reject debug directories that collide with formal inputs or outputs."""
     debug_path = Path(debug_dir).resolve()
-    if debug_path.exists():
-        raise ValueError(f"Connect debug directory already exists: {debug_dir}")
     resolved_paths = {
         Path(value).resolve()
         for value in paths
@@ -988,6 +1138,15 @@ def _validate_connect_debug_path(
     }
     if debug_path in resolved_paths:
         raise ValueError("Connect debug directory must not match an input or output path")
+
+
+def _reset_connect_debug_dir(debug_dir: str) -> None:
+    """Remove prior connect evidence so the current task can overwrite it."""
+    debug_path = Path(debug_dir)
+    if debug_path.exists():
+        if not debug_path.is_dir():
+            raise ValueError(f"Connect debug path is not a directory: {debug_dir}")
+        shutil.rmtree(debug_path)
 
 
 def _resolve_model_token_limit(model: OmniVoice) -> int | None:
@@ -1014,7 +1173,11 @@ def main():
     logging.basicConfig(format=formatter, level=logging.INFO, force=True)
 
     parser = get_parser()
+    task_started = time.perf_counter()
     args = parser.parse_args()
+    if args.offline:
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        os.environ["TRANSFORMERS_OFFLINE"] = "1"
     if args.connect_debug_dir is None:
         output_path = Path(args.output)
         args.connect_debug_dir = str(
@@ -1034,6 +1197,10 @@ def main():
     except ValueError as error:
         parser.error(str(error))
     try:
+        _reset_connect_debug_dir(args.connect_debug_dir)
+    except (OSError, ValueError) as error:
+        parser.error(str(error))
+    try:
         mode = resolve_cli_mode(
             args.text,
             args.source_audio,
@@ -1050,8 +1217,13 @@ def main():
 
     device = args.device or get_best_device()
     logger.info(f"Loading OmniVoice from {args.model} on {device} ...")
+    model_load_started = time.perf_counter()
     model = OmniVoice.from_pretrained(
         args.model, device_map=device, dtype=torch.float16
+    )
+    logger.info(
+        "[timing] CLI model load complete: %.3fs",
+        time.perf_counter() - model_load_started,
     )
     model_token_limit = _resolve_model_token_limit(model)
     if args.max_forced_segment_tokens is None and model_token_limit is not None:
@@ -1083,11 +1255,16 @@ def main():
         if regeneration_inputs is None:
             raise RuntimeError("Regeneration inputs were not prepared")
         options, requests = regeneration_inputs
+        regeneration_started = time.perf_counter()
         try:
             _run_regeneration(args, model, options, requests)
         except (OSError, RuntimeError, ValueError) as error:
             logger.error("Segment regeneration failed: %s", error)
             sys.exit(1)
+        logger.info(
+            "[timing] regeneration task total: %.3fs",
+            time.perf_counter() - regeneration_started,
+        )
         return
 
     logger.info(f"   Text: {args.text}")
@@ -1096,16 +1273,17 @@ def main():
     actions = parse_text_actions(args.text, markup_version=args.markup_version)
     logger.info(f"   Parsed {len(actions)} action(s): {actions}")
 
-    # Synthesize segment by segment
-    audio, sample_rate, timestamps = concatenate_audio_actions(
+    max_tokens = args.max_forced_segment_tokens or model_token_limit or args.max_char_len * 3
+    synthesis_started = time.perf_counter()
+    generated = generate_coherent_actions(
         actions=actions,
         model=model,
         voice=args.voice,
         ref_text=args.ref_text,
         instruct=args.instruct,
         language=args.language,
-        speed=args.speed,
         max_char_len=args.max_char_len,
+        max_tokens=max_tokens,
         num_step=args.num_step,
         guidance_scale=args.guidance_scale,
         denoise=args.denoise,
@@ -1116,26 +1294,127 @@ def main():
         markup_version=args.markup_version,
         connect_options=ConnectRuntimeOptions(args.connect_candidates, args.connect_processing, args.connect_aligner_device, args.connect_max_shorten_ms, args.connect_debug_dir, args.connect_aligner_model, args.connect_max_gap_ms, args.speed, args.connect_seed, args.max_forced_segment_tokens),
     )
+    logger.info(
+        "[timing] TTS/group generation: %.3fs groups=%d audio_samples=%d",
+        time.perf_counter() - synthesis_started,
+        len(generated.groups),
+        generated.waveform.shape[-1],
+    )
+    audio = generated.waveform
+    sample_rate = generated.sample_rate
+    timestamps: list[dict[str, object]] = []
+    need_subtitles = bool(args.srt or args.json_subtitle)
+    has_multi_sentence_group = any(len(group.units) > 1 for group in generated.groups)
+    if need_subtitles:
+        subtitle_started = time.perf_counter()
+        aligner = None
+        deadline = None
+        release_result = None
+        if has_multi_sentence_group:
+            aligner = WhisperXAligner(
+                args.whisperx_runtime_dir,
+                args.whisperx_language,
+                args.whisperx_device,
+                args.whisperx_model,
+            )
+            deadline = WhisperXAlignmentDeadline.from_timeout_seconds(
+                args.whisperx_timeout_seconds
+            )
+            release_result = release_tts_gpu_runtime(model)
+            if not release_result.released:
+                logger.warning(
+                    "Skipping WhisperX because TTS GPU release failed: %s",
+                    release_result.reason,
+                )
+                aligner = None
+                deadline = None
+        timestamps = resolve_generated_group_timings(generated, aligner, deadline)
+        logger.info(
+            "[timing] subtitle alignment/timeline: %.3fs subtitles=%d whisperx=%s",
+            time.perf_counter() - subtitle_started,
+            len(timestamps),
+            bool(aligner),
+        )
 
-    if args.boundary_silence < 0:
-        parser.error("--boundary_silence must not be negative")
-    if args.boundary_silence > 0:
-        padding = np.zeros(round(args.boundary_silence * sample_rate), dtype=np.float32)
-        audio = np.concatenate((padding, audio, padding))
+    if args.speed != 1.0:
+        original_frames = len(audio)
+        audio = change_audio_speed(audio, args.speed)
+        actual_scale = len(audio) / original_frames
         for timestamp in timestamps:
-            timestamp["start"] = round(timestamp["start"] + args.boundary_silence, 3)
-            timestamp["end"] = round(timestamp["end"] + args.boundary_silence, 3)
+            timestamp["start"] = round(float(timestamp["start"]) * actual_scale, 3)
+            timestamp["end"] = round(float(timestamp["end"]) * actual_scale, 3)
+
+    pre_padding_duration = len(audio) / sample_rate if sample_rate > 0 else 0.0
+    active_start_seconds = _detect_active_start_seconds(audio, sample_rate)
+    try:
+        leading_ms = args.leading_silence
+        trailing_ms = args.trailing_silence
+        if not np.isfinite(leading_ms) or not np.isfinite(trailing_ms):
+            raise ValueError("leading/trailing silence must be finite")
+        if leading_ms < 0 or trailing_ms < 0:
+            raise ValueError("leading/trailing silence must not be negative")
+        leading_seconds = leading_ms / 1000.0
+        trailing_seconds = trailing_ms / 1000.0
+        if leading_seconds > 0 or trailing_seconds > 0:
+            leading_padding = np.zeros(
+                round(leading_seconds * sample_rate), dtype=np.float32
+            )
+            trailing_padding = np.zeros(
+                round(trailing_seconds * sample_rate), dtype=np.float32
+            )
+            audio = np.concatenate((leading_padding, audio, trailing_padding))
+            for timestamp in timestamps:
+                timestamp["start"] = round(
+                    float(timestamp["start"]) + leading_seconds, 3
+                )
+                timestamp["end"] = round(
+                    float(timestamp["end"]) + leading_seconds, 3
+                )
+        subtitle_offset_seconds = _resolve_subtitle_offset(
+            args.subtitle_offset,
+            active_start_seconds,
+        )
+        detection_peak = float(np.max(np.abs(audio))) if audio.size else 0.0
+        detection_threshold = max(
+            1e-5,
+            detection_peak * (10.0 ** (-50.0 / 20.0)),
+        )
+        post_padding_duration = len(audio) / sample_rate if sample_rate > 0 else 0.0
+        logger.info(
+            "[timing] subtitle offset resolution: active_start_seconds=%.6f "
+            "detection_peak=%.6f detection_threshold=%.6f "
+            "requested_offset=%s resolved_offset_seconds=%.6f "
+            "leading_silence_ms=%.3f trailing_silence_ms=%.3f "
+            "pre_padding_duration=%.3fs post_padding_duration=%.3fs",
+            active_start_seconds,
+            detection_peak,
+            detection_threshold,
+            args.subtitle_offset,
+            subtitle_offset_seconds,
+            leading_ms,
+            trailing_ms,
+            pre_padding_duration,
+            post_padding_duration,
+        )
+        _apply_subtitle_offset(timestamps, subtitle_offset_seconds)
+    except ValueError as error:
+        parser.error(str(error))
 
     # Save audio
+    publication_started = time.perf_counter()
     actual_output = save_audio(audio, sample_rate, args.output)
     final_waveform, final_sample_rate = load_waveform(actual_output)
     final_duration = final_waveform.shape[-1] / final_sample_rate
     if timestamps and timestamps[-1]["end"] > final_duration + 0.01:
         parser.error("Final subtitle timeline exceeds encoded audio duration")
     logger.info(f"Audio saved to: {actual_output}")
+    logger.info(
+        "[timing] audio encode/readback: %.3fs final_duration=%.3fs",
+        time.perf_counter() - publication_started,
+        final_duration,
+    )
 
     # Generate SRT subtitles
-    need_subtitles = bool(args.srt or args.json_subtitle)
     if need_subtitles and timestamps:
         logger.info("Generated subtitles:")
         for ts in timestamps:
@@ -1166,6 +1445,11 @@ def main():
             with open(args.json_subtitle, "w", encoding="utf-8") as f:
                 json.dump(json_data, f, ensure_ascii=False, indent=2)
             logger.info(f"JSON subtitle saved to: {args.json_subtitle}")
+
+    logger.info(
+        "[timing] CLI task total: %.3fs",
+        time.perf_counter() - task_started,
+    )
 
 
 if __name__ == "__main__":

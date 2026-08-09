@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import shutil
 import tempfile
@@ -23,15 +24,105 @@ from omnivoice.utils.segment_timeline import (
     load_subtitles,
     parse_cli_timestamp,
     parse_replacements,
+    normalize_replacement_requests,
     rebuild_subtitle_timeline,
     resolve_cli_mode,
+    validate_subtitles,
     validate_regeneration_inputs,
+)
+from omnivoice.utils.sentence_timing import (
+    SentenceTiming,
+    TimingResolution,
+    build_weighted_sentence_timings,
 )
 
 
 SUPPORTED_OUTPUT_EXTENSIONS = {".wav", ".flac", ".ogg", ".mp3"}
-SegmentGenerator = Callable[[str, str], None]
+OVERLAP_DURATION_SECONDS = 0.015
+SegmentGenerator = Callable[[ReplacementRequest, str], None]
 SubtitleCleaner = Callable[[str], str]
+AlignmentTextResolver = Callable[[str], str]
+AlignmentResolver = Callable[
+    [str, Sequence[str], int, int], TimingResolution
+]
+BeforeAlignment = Callable[[], None]
+
+
+def _build_splice_plan(
+    source: np.ndarray,
+    sample_rate: int,
+    requests: Sequence[ReplacementRequest],
+    generated: Sequence[np.ndarray],
+) -> tuple[list[np.ndarray], list[int], tuple[int, ...]]:
+    """Build original-axis pieces, replacement indexes, and actual overlaps."""
+    pieces: list[np.ndarray] = []
+    replacement_indexes: list[int] = []
+    cursor = 0
+    for request, replacement in zip(requests, generated):
+        start_sample = round(request.start * sample_rate)
+        end_sample = round(request.end * sample_rate)
+        retained = source[:, cursor:start_sample]
+        if retained.shape[-1] > 0:
+            pieces.append(retained)
+        pieces.append(replacement)
+        replacement_indexes.append(len(pieces) - 1)
+        cursor = end_sample
+    trailing = source[:, cursor:]
+    if trailing.shape[-1] > 0:
+        pieces.append(trailing)
+    overlaps = _choose_overlap_lengths(
+        [piece.shape[-1] for piece in pieces],
+        round(OVERLAP_DURATION_SECONDS * sample_rate),
+    )
+    return pieces, replacement_indexes, overlaps
+
+
+def _covered_subtitle_indexes(
+    subtitles: Sequence[SubtitleItem],
+    request: ReplacementRequest,
+) -> list[int]:
+    """Return subtitle indexes covered by one complete replacement request."""
+    return [
+        index
+        for index, item in enumerate(subtitles)
+        if item.end > request.start + 0.01
+        and item.start < request.end - 0.01
+    ]
+
+
+def _validate_sentence_timings(
+    timings: Sequence[SentenceTiming],
+    generated_samples: int,
+) -> None:
+    """Validate an alignment resolver result before output mapping."""
+    previous_end = 0
+    for timing in timings:
+        if (
+            timing.start_sample < 0
+            or timing.end_sample > generated_samples
+            or timing.start_sample < previous_end
+            or timing.end_sample <= timing.start_sample
+        ):
+            raise ValueError("Alignment returned invalid sentence sample bounds")
+        previous_end = timing.end_sample
+
+
+def _clip_sentence_timings(
+    timings: Sequence[SentenceTiming],
+    window_start: int,
+    window_end: int,
+) -> tuple[SentenceTiming, ...]:
+    """Clip aligned sentence boundaries to the non-overlap subtitle window."""
+    clipped: list[SentenceTiming] = []
+    previous = window_start
+    for index, timing in enumerate(timings):
+        start = previous
+        end = window_end if index == len(timings) - 1 else min(window_end, timing.end_sample)
+        if end <= start:
+            raise ValueError("Alignment is empty after overlap clipping")
+        clipped.append(SentenceTiming(start, end))
+        previous = end
+    return tuple(clipped)
 
 
 @dataclass(frozen=True)
@@ -53,6 +144,7 @@ class RegenerationResult:
     sample_rate: int
     total_seconds: float
     subtitles: tuple[SubtitleItem, ...]
+    group_metadata: tuple[dict[str, object], ...] = ()
 
 
 def validate_regeneration_paths(options: RegenerationOptions) -> None:
@@ -123,24 +215,36 @@ def _normalize_generated_audio(
     return np.repeat(mono, target_channels, axis=0)
 
 
-def _fade_piece(
-    waveform: np.ndarray,
-    fade_samples: int,
-    fade_in: bool,
-    fade_out: bool,
+def _choose_overlap_lengths(
+    piece_lengths: Sequence[int], target_samples: int
+) -> tuple[int, ...]:
+    """Choose safe overlap lengths for each adjacent pair of pieces."""
+    if target_samples < 0:
+        raise ValueError("Overlap target must not be negative")
+    if len(piece_lengths) < 2:
+        return ()
+    return tuple(
+        min(target_samples, left, right)
+        for left, right in zip(piece_lengths, piece_lengths[1:])
+    )
+
+
+def _overlap_add(
+    left: np.ndarray,
+    right: np.ndarray,
+    overlap_samples: int,
 ) -> np.ndarray:
-    """Apply edge fades without changing a piece's sample count."""
-    if waveform.shape[-1] == 0 or fade_samples <= 0:
-        return waveform
-    result = waveform.copy()
-    length = min(fade_samples, result.shape[-1] // 2)
-    if length == 0:
-        return result
-    if fade_in:
-        result[:, :length] *= np.linspace(0.0, 1.0, length, dtype=np.float32)
-    if fade_out:
-        result[:, -length:] *= np.linspace(1.0, 0.0, length, dtype=np.float32)
-    return result
+    """Join two channels-first waveforms with equal-power overlap-add."""
+    if left.ndim != 2 or right.ndim != 2 or left.shape[0] != right.shape[0]:
+        raise ValueError("Overlap-add waveforms must be channels-first with matching channels")
+    overlap = min(overlap_samples, left.shape[-1], right.shape[-1])
+    if overlap <= 0:
+        return np.concatenate((left, right), axis=-1)
+    phase = np.linspace(0.0, np.pi / 2.0, overlap, dtype=np.float32)
+    left_gain = np.cos(phase)
+    right_gain = np.sin(phase)
+    mixed = left[:, -overlap:] * left_gain + right[:, :overlap] * right_gain
+    return np.concatenate((left[:, :-overlap], mixed, right[:, overlap:]), axis=-1)
 
 
 def _splice_waveforms(
@@ -148,33 +252,15 @@ def _splice_waveforms(
     sample_rate: int,
     requests: Sequence[ReplacementRequest],
     generated: Sequence[np.ndarray],
-    fade_duration: float = 0.01,
 ) -> np.ndarray:
-    """Cut on the original sample timeline and concatenate replacement clips."""
-    pieces: list[np.ndarray] = []
-    cursor = 0
-    for request, replacement in zip(requests, generated):
-        start_sample = round(request.start * sample_rate)
-        end_sample = round(request.end * sample_rate)
-        pieces.append(source[:, cursor:start_sample])
-        pieces.append(replacement)
-        cursor = end_sample
-    pieces.append(source[:, cursor:])
-
-    fade_samples = round(fade_duration * sample_rate)
-    faded = [
-        _fade_piece(
-            piece,
-            fade_samples,
-            fade_in=index > 0,
-            fade_out=index < len(pieces) - 1,
-        )
-        for index, piece in enumerate(pieces)
-        if piece.shape[-1] > 0
-    ]
-    if not faded:
+    """Cut on the original sample timeline and overlap-add replacement clips."""
+    pieces, _, overlaps = _build_splice_plan(source, sample_rate, requests, generated)
+    if not pieces:
         raise ValueError("Regenerated audio contains no samples")
-    return np.concatenate(faded, axis=-1)
+    result = pieces[0]
+    for index, piece in enumerate(pieces[1:]):
+        result = _overlap_add(result, piece, overlaps[index])
+    return result
 
 
 def _write_audio(path: Path, waveform: np.ndarray, sample_rate: int) -> None:
@@ -220,6 +306,7 @@ def _write_subtitle_outputs(
     subtitles: Sequence[SubtitleItem],
     sample_rate: int,
     total_seconds: float,
+    group_metadata: Sequence[dict[str, object]] | None = None,
 ) -> list[tuple[Path, Path]]:
     """Write requested temporary subtitle artifacts from one shared timeline."""
     artifacts: list[tuple[Path, Path]] = []
@@ -239,6 +326,7 @@ def _write_subtitle_outputs(
                 {"start": round(item.start, 3), "end": round(item.end, 3), "text": item.text}
                 for item in subtitles
             ],
+            "groups": list(group_metadata or ()),
         }
         temporary.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -270,6 +358,9 @@ def regenerate_audio_segments(
     segment_generator: SegmentGenerator,
     subtitle_cleaner: SubtitleCleaner,
     subtitle_splitter: SubtitleSplitter,
+    alignment_resolver: AlignmentResolver | None = None,
+    alignment_text_resolver: AlignmentTextResolver | None = None,
+    before_alignment: BeforeAlignment | None = None,
 ) -> RegenerationResult:
     """Generate replacement clips, splice audio, rebuild subtitles, and publish."""
     validate_regeneration_paths(options)
@@ -282,10 +373,12 @@ def regenerate_audio_segments(
         temp_dir = Path(temp_value)
         generated_waveforms: list[np.ndarray] = []
         generated_durations: list[float] = []
-        display_texts: list[str] = []
+        display_texts: list[list[str]] = []
+        alignment_texts: list[list[str]] = []
+        segment_paths: list[Path] = []
         for index, request in enumerate(requests, 1):
             segment_path = temp_dir / f"replacement-{index}.wav"
-            segment_generator(request.text, str(segment_path))
+            segment_generator(request, str(segment_path))
             if not segment_path.is_file():
                 raise RuntimeError(f"Replacement #{index} did not produce an audio file")
             waveform, sample_rate = load_waveform(str(segment_path))
@@ -297,25 +390,152 @@ def regenerate_audio_segments(
             )
             generated_waveforms.append(normalized)
             generated_durations.append(normalized.shape[-1] / source_sample_rate)
-            display_text = subtitle_cleaner(request.text).strip()
-            if not display_text:
+            if isinstance(request.text, list):
+                display_text = [subtitle_cleaner(item).strip() for item in request.text]
+            else:
+                display_text = [subtitle_cleaner(request.text).strip()]
+            if not display_text or any(not item for item in display_text):
                 raise ValueError(f"Replacement #{index} has no display subtitle text")
             display_texts.append(display_text)
+            raw_texts = request.text if isinstance(request.text, list) else [request.text]
+            resolved_alignment_texts = [
+                (alignment_text_resolver(item) if alignment_text_resolver else item).strip()
+                for item in raw_texts
+            ]
+            if len(resolved_alignment_texts) != len(display_text):
+                raise ValueError(
+                    f"Replacement #{index} has no one-to-one alignment subtitle text"
+                )
+            alignment_texts.append(resolved_alignment_texts)
+            segment_paths.append(segment_path)
 
-        final_waveform = _splice_waveforms(
+        if before_alignment is not None:
+            before_alignment()
+
+        pieces, replacement_indexes, overlaps = _build_splice_plan(
             source_waveform,
             source_sample_rate,
             requests,
             generated_waveforms,
         )
-        subtitles = rebuild_subtitle_timeline(
-            source_subtitles,
-            requests,
-            generated_durations,
-            display_texts,
-            subtitle_splitter,
-            options.max_char_len,
-        )
+        final_waveform = pieces[0]
+        for index, piece in enumerate(pieces[1:]):
+            final_waveform = _overlap_add(final_waveform, piece, overlaps[index])
+        overlap_durations = []
+        piece_starts: list[int] = []
+        output_samples = 0
+        for index, piece in enumerate(pieces):
+            left_overlap = overlaps[index - 1] if index > 0 else 0
+            piece_starts.append(output_samples - left_overlap)
+            output_samples += piece.shape[-1] - left_overlap
+        for piece_index in replacement_indexes:
+            left_overlap = overlaps[piece_index - 1] if piece_index > 0 else 0
+            right_overlap = overlaps[piece_index] if piece_index < len(overlaps) else 0
+            overlap_durations.append(
+                (
+                    left_overlap / source_sample_rate,
+                    right_overlap / source_sample_rate,
+                )
+            )
+        subtitles: list[SubtitleItem] = []
+        group_metadata: list[dict[str, object]] = []
+        subtitle_index = 0
+        cumulative_delta_samples = 0
+        for request_index, (request, generated, piece_index) in enumerate(
+            zip(requests, generated_waveforms, replacement_indexes)
+        ):
+            covered_indexes = _covered_subtitle_indexes(source_subtitles, request)
+            if not covered_indexes:
+                raise ValueError("Replacement group does not cover source subtitles")
+            while subtitle_index < covered_indexes[0]:
+                item = source_subtitles[subtitle_index]
+                offset = cumulative_delta_samples / source_sample_rate
+                subtitles.append(SubtitleItem(round(item.start + offset, 6), round(item.end + offset, 6), item.text))
+                subtitle_index += 1
+
+            left_overlap = overlaps[piece_index - 1] if piece_index > 0 else 0
+            right_overlap = overlaps[piece_index] if piece_index < len(overlaps) else 0
+            generated_samples = generated.shape[-1]
+            sentence_texts = display_texts[request_index]
+            sentence_alignment_texts = alignment_texts[request_index]
+            timings: Sequence[SentenceTiming]
+            timing_method = "pronunciation_weight_fallback"
+            alignment_coverage = 0.0
+            fallback_reason = "alignment_not_requested"
+            if len(sentence_texts) == 1:
+                timings = (
+                    SentenceTiming(left_overlap, generated_samples - right_overlap),
+                )
+                timing_method = "single_sentence_duration"
+            else:
+                if alignment_resolver is not None:
+                    try:
+                        candidate = alignment_resolver(
+                            str(segment_paths[request_index]),
+                            sentence_alignment_texts,
+                            generated_samples,
+                            source_sample_rate,
+                        )
+                        _validate_sentence_timings(candidate.timings, generated_samples)
+                        if len(candidate.timings) != len(sentence_texts):
+                            raise ValueError("Alignment sentence count does not match subtitles")
+                        timings = _clip_sentence_timings(
+                            candidate.timings,
+                            left_overlap,
+                            generated_samples - right_overlap,
+                        )
+                        timing_method = candidate.timing_method
+                        fallback_reason = candidate.fallback_reason
+                        alignment_coverage = candidate.alignment_coverage
+                    except Exception as error:
+                        fallback_reason = str(error)[:500]
+                        timings = build_weighted_sentence_timings(
+                            sentence_texts,
+                            generated_samples,
+                            left_overlap,
+                            right_overlap,
+                        )
+                else:
+                    timings = build_weighted_sentence_timings(
+                        sentence_texts,
+                        generated_samples,
+                        left_overlap,
+                        right_overlap,
+                    )
+            output_origin = piece_starts[piece_index]
+            for item_index, timing, sentence_text in zip(
+                covered_indexes, timings, sentence_texts
+            ):
+                del item_index
+                subtitles.append(
+                    SubtitleItem(
+                        round((output_origin + timing.start_sample) / source_sample_rate, 6),
+                        round((output_origin + timing.end_sample) / source_sample_rate, 6),
+                        sentence_text,
+                    )
+                )
+            subtitle_index = covered_indexes[-1] + 1
+            original_samples = round((request.end - request.start) * source_sample_rate)
+            group_delta = generated_samples - original_samples - left_overlap - right_overlap
+            cumulative_delta_samples += group_delta
+            group_metadata.append(
+                {
+                    "sentence_ids": [index + 1 for index in covered_indexes],
+                    "timing_method": timing_method,
+                    "alignment_coverage": alignment_coverage,
+                    "fallback_reason": fallback_reason,
+                    "generated_samples": generated_samples,
+                    "left_overlap_samples": left_overlap,
+                    "right_overlap_samples": right_overlap,
+                    "delta_samples": group_delta,
+                }
+            )
+        while subtitle_index < len(source_subtitles):
+            item = source_subtitles[subtitle_index]
+            offset = cumulative_delta_samples / source_sample_rate
+            subtitles.append(SubtitleItem(round(item.start + offset, 6), round(item.end + offset, 6), item.text))
+            subtitle_index += 1
+        validate_subtitles(subtitles)
 
         output_audio = Path(options.output_audio)
         temporary_audio = temp_dir / output_audio.name
@@ -335,6 +555,7 @@ def regenerate_audio_segments(
                 subtitles,
                 source_sample_rate,
                 total_seconds,
+                group_metadata,
             )
         )
         _publish_artifacts(artifacts)
@@ -343,6 +564,7 @@ def regenerate_audio_segments(
         sample_rate=source_sample_rate,
         total_seconds=total_seconds,
         subtitles=tuple(subtitles),
+        group_metadata=tuple(group_metadata),
     )
 
 
@@ -354,6 +576,7 @@ __all__ = [
     "load_subtitles",
     "parse_cli_timestamp",
     "parse_replacements",
+    "normalize_replacement_requests",
     "rebuild_subtitle_timeline",
     "regenerate_audio_segments",
     "resolve_cli_mode",

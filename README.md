@@ -300,7 +300,7 @@ omnivoice-infer-advanced \
     --model k2-fsa/OmniVoice \
     --source_audio original.wav \
     --source_subtitle original.srt \
-    --regenerate_segments '[["00:00:04.509","00:00:06.655","第一，具有相同的度；"],["00:00:19.537","00:00:21.899","结果还是 n 度关系，"]]' \
+    --regenerate_segments '[["00:00:04.509","00:00:06.655","第一，具有相同的度；",1.0],["00:00:19.537","00:00:21.899","结果还是 n 度关系，",1.0]]' \
     --voice speaker.wav \
     --ref_text "Reference transcript." \
     --output repaired.wav \
@@ -308,8 +308,12 @@ omnivoice-infer-advanced \
     --json_subtitle repaired.json
 ```
 
-Replacement timestamps must use `HH:MM:SS.mmm`, be ordered and non-overlapping,
-and align with complete source subtitle boundaries within 10 ms. The source
+Replacement requests use the IndexTTS-compatible four-item format
+`[start, end, text|string[], speechSpeed]`; a text array supplies one sentence
+per covered source subtitle. Legacy three-item requests remain accepted and use
+the global `--speed` value. Adjacent complete requests with the same speed are
+merged into one coherent generation group. Timestamps must use
+`HH:MM:SS.mmm`, be ordered and non-overlapping, and align with complete source subtitle boundaries within 10 ms. The source
 audio and subtitle are read-only. Output paths must be distinct from all inputs
 and must not already exist. WAV, FLAC, OGG, and MP3 output are supported; MP3 is
 decoded and re-encoded rather than cut at compressed-frame boundaries.
@@ -317,6 +321,32 @@ decoded and re-encoded rather than cut at compressed-frame boundaries.
 The replacement text supports the same `[pause]`, `[replace]`, pronunciation,
 and `[connect]` markup as normal advanced inference. At least one rebuilt
 subtitle output (`--srt` or `--json_subtitle`) is required.
+
+When multi-sentence subtitles are requested, OmniVoice first generates all TTS
+groups, releases the TTS GPU runtime, and then invokes the shared offline
+WhisperX runtime on CUDA. The defaults are
+`/opt/app/aining/digital_human/whisperx`, the local Chinese model at
+`/opt/app/aining/digital_human/whisperx/models/zh`, and a three-hour total
+alignment deadline. Use `--whisperx_runtime_dir`, `--whisperx_model`,
+`--whisperx_language`, `--whisperx_device cuda`, and
+`--whisperx_timeout_seconds` to override the runtime settings. Alignment
+failure, timeout, OOM, unavailable CUDA, or TTS GPU-release failure preserves
+generated audio and uses pronunciation-weight subtitle timing; it never falls
+back to CPU WhisperX.
+
+The CLI accepts `--leading_silence` and `--trailing_silence` in milliseconds
+(both default to `300`), plus `--subtitle_offset auto` or a numeric millisecond
+offset. The automatic offset is measured from each generated waveform before
+synthetic boundary padding and is reported in the subtitle timing log.
+
+The advanced CLI uses the local HuggingFace/Transformers cache by default and
+does not access HuggingFace at runtime. Use `--no-offline` only in an
+environment where model downloads are explicitly allowed.
+
+To initialize or verify all offline caches, use
+[`scripts/prepare_offline_cache.py`](scripts/prepare_offline_cache.py). Run it
+on a connected preparation machine for download, then run it with
+`--check-only` on the GPU server.
 
 For Chinese `[connect:...]`, see [conservative waveform processing](docs/connect_conservative_waveform_processing_zh.md). It uses three candidates and optional FunASR alignment; install it with `uv sync --extra connect`. `--connect_seed` makes candidate derivation reproducible, `--connect_debug_dir` writes alignment/quality evidence, and `--max_forced_segment_tokens` provides an explicit model-safe segment limit.
 

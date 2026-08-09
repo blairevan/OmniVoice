@@ -2,6 +2,7 @@
 
 import unittest
 import tempfile
+from unittest.mock import patch
 from pathlib import Path
 
 import numpy as np
@@ -15,6 +16,7 @@ from omnivoice.utils.connect_waveform_processor import (
 from omnivoice.utils.connect_candidate_pipeline import (
     ConnectRuntimeOptions,
     _normalize_funasr_timestamps,
+    _resolve_local_funasr_model_path,
     select_connect_waveform,
 )
 
@@ -115,6 +117,22 @@ class ConnectWaveformTests(unittest.TestCase):
 class ConnectPipelineTests(unittest.TestCase):
     """Verify candidate evidence and selection without downloading FunASR."""
 
+    def test_funasr_model_path_requires_complete_local_snapshot(self) -> None:
+        """Resolve a complete local snapshot and reject missing runtime models."""
+        with tempfile.TemporaryDirectory() as directory:
+            model_path = Path(directory) / "model"
+            model_path.mkdir()
+            (model_path / "configuration.json").write_text("{}", encoding="utf-8")
+            (model_path / "model.pt").write_bytes(b"weights")
+            self.assertEqual(
+                str(model_path),
+                _resolve_local_funasr_model_path(str(model_path)),
+            )
+
+        with patch.dict("os.environ", {"MODELSCOPE_CACHE": directory}, clear=False):
+            with self.assertRaisesRegex(RuntimeError, "Runtime download is disabled"):
+                _resolve_local_funasr_model_path("fa-zh")
+
     def test_pipeline_persists_original_alignment_and_selection(self) -> None:
         """Keep candidate evidence when an explicit debug directory is supplied."""
         markup = parse_connect_markup("[connect:课程]")
@@ -123,8 +141,11 @@ class ConnectPipelineTests(unittest.TestCase):
             return (CharacterTimestamp("课", 0, 100), CharacterTimestamp("程", 180, 280))
         with tempfile.TemporaryDirectory() as directory:
             debug_dir = str(Path(directory) / "connect_debug")
-            selection = select_connect_waveform(markup, 1000, lambda: waveform, align, ConnectRuntimeOptions(candidates=1, debug_dir=debug_dir), ConnectProcessingOptions())
+            with self.assertLogs("omnivoice.utils.connect_candidate_pipeline", level="INFO") as captured:
+                selection = select_connect_waveform(markup, 1000, lambda: waveform, align, ConnectRuntimeOptions(candidates=1, debug_dir=debug_dir), ConnectProcessingOptions())
             self.assertEqual(1, selection.candidate_index)
+            self.assertTrue(any("[connect] candidate selected candidate=1" in line for line in captured.output))
+            self.assertTrue(any("[connect] candidate evaluation candidate=1" in line for line in captured.output))
             self.assertTrue((Path(debug_dir) / "candidate_001_original_alignment.json").is_file())
             self.assertTrue((Path(debug_dir) / "selection.json").is_file())
             selection_data = (Path(debug_dir) / "selection.json").read_text(encoding="utf-8")

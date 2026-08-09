@@ -8,6 +8,7 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 
+from omnivoice.utils.sentence_timing import SentenceTiming, TimingResolution
 from omnivoice.utils.audio_segment_regenerator import (
     RegenerationOptions,
     ReplacementRequest,
@@ -15,11 +16,14 @@ from omnivoice.utils.audio_segment_regenerator import (
     load_subtitles,
     parse_cli_timestamp,
     parse_replacements,
+    normalize_replacement_requests,
     rebuild_subtitle_timeline,
     regenerate_audio_segments,
     resolve_cli_mode,
     validate_regeneration_inputs,
     validate_regeneration_paths,
+    _choose_overlap_lengths,
+    _overlap_add,
 )
 
 
@@ -44,6 +48,52 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(2, len(requests))
         self.assertAlmostEqual(4.509, requests[0].start)
         self.assertEqual("第二句，", requests[1].text)
+
+    def test_parse_replacements_accepts_index_tts_four_item_contract(self) -> None:
+        """Parse per-request speech speed and one text item per subtitle."""
+        requests = parse_replacements(
+            '[["00:00:04.509","00:00:06.655",["新的句子。"],1.1]]'
+        )
+        self.assertEqual(["新的句子。"], requests[0].text)
+        self.assertAlmostEqual(1.1, requests[0].speech_speed)
+
+    def test_parse_replacements_rejects_invalid_speech_speed(self) -> None:
+        """Reject missing or non-positive per-request speech speed."""
+        with self.assertRaisesRegex(ValueError, "speechSpeed"):
+            parse_replacements(
+                '[["00:00:01.000","00:00:02.000","new",0]]'
+            )
+
+    def test_normalize_merges_adjacent_requests_with_matching_speed(self) -> None:
+        """Merge complete adjacent requests before independent TTS generation."""
+        subtitles = [
+            SubtitleItem(0.0, 1.0, "旧一。"),
+            SubtitleItem(1.0, 2.0, "旧二。"),
+            SubtitleItem(3.0, 4.0, "旧三。"),
+        ]
+        requests = parse_replacements(
+            '[["00:00:00.000","00:00:01.000","新一。",1.1],'
+            '["00:00:01.000","00:00:02.000","新二。",1.1],'
+            '["00:00:03.000","00:00:04.000","新三。",0.9]]'
+        )
+
+        normalized = normalize_replacement_requests(subtitles, requests)
+
+        self.assertEqual(2, len(normalized))
+        self.assertEqual(["新一。", "新二。"], normalized[0].text)
+        self.assertAlmostEqual(1.1, normalized[0].speech_speed)
+        self.assertEqual("新三。", normalized[1].text)
+
+    def test_normalize_rejects_adjacent_requests_with_different_speed(self) -> None:
+        """Do not fake coherent speech when adjacent requests use different speed."""
+        subtitles = [SubtitleItem(0.0, 1.0, "旧一。"), SubtitleItem(1.0, 2.0, "旧二。")]
+        requests = parse_replacements(
+            '[["00:00:00.000","00:00:01.000","新一。",1.0],'
+            '["00:00:01.000","00:00:02.000","新二。",1.1]]'
+        )
+
+        with self.assertRaisesRegex(ValueError, "speech speed"):
+            normalize_replacement_requests(subtitles, requests)
 
     def test_parse_replacements_rejects_blank_text(self) -> None:
         """Reject a replacement whose new script is blank."""
@@ -273,6 +323,16 @@ class AudioRegenerationTests(unittest.TestCase):
         del max_char_len
         return [SubtitleItem(0.0, duration, text)]
 
+    def test_overlap_add_uses_equal_power_and_actual_samples(self) -> None:
+        """Use 15ms overlap and close the output sample count exactly."""
+        overlaps = _choose_overlap_lengths((100, 100), 15)
+        self.assertEqual((15,), overlaps)
+        left = np.ones((1, 100), dtype=np.float32)
+        right = np.ones((1, 100), dtype=np.float32)
+        result = _overlap_add(left, right, overlaps[0])
+        self.assertEqual(185, result.shape[-1])
+        self.assertTrue(np.isfinite(result).all())
+
     def test_regenerate_splices_clip_and_writes_matching_subtitles(self) -> None:
         """Replace one second with two seconds and shift the following subtitle."""
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -289,9 +349,9 @@ class AudioRegenerationTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            def fake_segment_generator(text: str, output_path: str) -> None:
+            def fake_segment_generator(request: ReplacementRequest, output_path: str) -> None:
                 """Write a deterministic two-second mono replacement WAV."""
-                self.assertEqual("new", text)
+                self.assertEqual("new", request.text)
                 sf.write(
                     output_path,
                     np.ones(22050 * 2, dtype=np.float32) * 0.01,
@@ -316,14 +376,82 @@ class AudioRegenerationTests(unittest.TestCase):
             payload = json.loads(output_json.read_text(encoding="utf-8"))
             audio_info = sf.info(output_audio)
             self.assertEqual(source_audio_bytes, source_audio.read_bytes())
-            self.assertAlmostEqual(5.0, result.total_seconds, places=3)
+            self.assertAlmostEqual(4.985, result.total_seconds, places=3)
             self.assertEqual(16000, audio_info.samplerate)
             self.assertEqual(2, audio_info.channels)
             self.assertEqual("new", payload["sentences"][0]["text"])
-            self.assertAlmostEqual(2.0, payload["sentences"][1]["start"], places=3)
+            self.assertAlmostEqual(1.985, payload["sentences"][1]["start"], places=3)
             self.assertIn(
-                "00:00:02,000 --> 00:00:05,000",
+                "00:00:01,985 --> 00:00:04,985",
                 output_srt.read_text(encoding="utf-8"),
+            )
+
+    def test_regeneration_resolves_whisperx_against_alignment_text(self) -> None:
+        """Keep display text separate from the transcript supplied to WhisperX."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source_audio = Path(temp_dir) / "source.wav"
+            source_subtitle = Path(temp_dir) / "source.srt"
+            output_audio = Path(temp_dir) / "output.wav"
+            output_srt = Path(temp_dir) / "output.srt"
+            sf.write(source_audio, np.zeros(16000 * 2, dtype=np.float32), 16000)
+            source_subtitle.write_text(
+                "1\n00:00:00,000 --> 00:00:01,000\nold one\n\n"
+                "2\n00:00:01,000 --> 00:00:02,000\nold two\n",
+                encoding="utf-8",
+            )
+            captured: list[tuple[str, ...]] = []
+
+            def generator(request: ReplacementRequest, output_path: str) -> None:
+                """Write one replacement waveform for the coherent source range."""
+                del request
+                sf.write(output_path, np.ones(16000 * 2, dtype=np.float32), 16000)
+
+            def resolver(
+                audio_path: str,
+                alignment_texts: tuple[str, ...],
+                generated_samples: int,
+                sample_rate: int,
+            ) -> TimingResolution:
+                """Capture the alignment layer instead of visible subtitle text."""
+                del audio_path, generated_samples, sample_rate
+                captured.append(alignment_texts)
+                return TimingResolution(
+                    (SentenceTiming(0, 16000), SentenceTiming(16000, 32000)),
+                    "whisperx_alignment",
+                    1.0,
+                    None,
+                )
+
+            result = regenerate_audio_segments(
+                options=RegenerationOptions(
+                    str(source_audio),
+                    str(source_subtitle),
+                    str(output_audio),
+                    str(output_srt),
+                    None,
+                    80,
+                ),
+                requests=[
+                    ReplacementRequest(
+                        0.0,
+                        2.0,
+                        ["visible-one", "visible-two"],
+                    )
+                ],
+                segment_generator=generator,
+                subtitle_cleaner=self.cleaner,
+                subtitle_splitter=self.splitter,
+                alignment_resolver=resolver,
+                alignment_text_resolver=lambda text: f"align:{text}",
+            )
+
+            self.assertEqual(
+                [["align:visible-one", "align:visible-two"]],
+                captured,
+            )
+            self.assertEqual(
+                ["visible-one", "visible-two"],
+                [item.text for item in result.subtitles],
             )
 
     def test_generator_failure_does_not_publish_outputs(self) -> None:
@@ -339,9 +467,9 @@ class AudioRegenerationTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            def failing_generator(text: str, output_path: str) -> None:
+            def failing_generator(request: ReplacementRequest, output_path: str) -> None:
                 """Simulate a TTS failure before writing a segment."""
-                del text, output_path
+                del request, output_path
                 raise RuntimeError("synthetic failure")
 
             with self.assertRaisesRegex(RuntimeError, "synthetic failure"):

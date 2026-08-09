@@ -32,6 +32,7 @@ import logging
 import math
 import os
 import re
+import time
 from dataclasses import dataclass, fields
 from functools import partial
 from typing import Any, List, Optional, Union
@@ -194,7 +195,10 @@ def _resolve_model_path(name_or_path: str) -> str:
         return name_or_path
     from huggingface_hub import snapshot_download
 
-    return snapshot_download(name_or_path)
+    offline = os.getenv("HF_HUB_OFFLINE") == "1" or os.getenv(
+        "TRANSFORMERS_OFFLINE"
+    ) == "1"
+    return snapshot_download(name_or_path, local_files_only=offline)
 
 
 class OmniVoice(PreTrainedModel):
@@ -252,15 +256,34 @@ class OmniVoice(PreTrainedModel):
         # Suppress noisy INFO logs from transformers/huggingface_hub during loading
         _prev_disable = logging.root.manager.disable
         logging.disable(logging.INFO)
+        load_started = time.perf_counter()
+        stage_started = load_started
+        stage_durations: dict[str, float] = {}
+        offline = os.getenv("HF_HUB_OFFLINE") == "1" or os.getenv(
+            "TRANSFORMERS_OFFLINE"
+        ) == "1"
 
         try:
             # Resolve to local path first; download only if not already cached
             resolved_path = _resolve_model_path(pretrained_model_name_or_path)
+            stage_durations["resolve_model_path"] = time.perf_counter() - stage_started
 
-            model = super().from_pretrained(resolved_path, *args, **kwargs)
+            load_kwargs = dict(kwargs)
+            if offline:
+                load_kwargs["local_files_only"] = True
+            model = super().from_pretrained(resolved_path, *args, **load_kwargs)
+            stage_started = time.perf_counter()
+            stage_durations["model_weights"] = stage_started - (
+                load_started + stage_durations["resolve_model_path"]
+            )
 
             if not train_mode:
-                model.text_tokenizer = AutoTokenizer.from_pretrained(resolved_path)
+                model.text_tokenizer = AutoTokenizer.from_pretrained(
+                    resolved_path,
+                    local_files_only=offline,
+                )
+                stage_durations["text_tokenizer"] = time.perf_counter() - stage_started
+                stage_started = time.perf_counter()
 
                 audio_tokenizer_path = os.path.join(resolved_path, "audio_tokenizer")
 
@@ -275,11 +298,17 @@ class OmniVoice(PreTrainedModel):
                     "cpu" if str(model.device).startswith("mps") else model.device
                 )
                 model.audio_tokenizer = HiggsAudioV2TokenizerModel.from_pretrained(
-                    audio_tokenizer_path, device_map=tokenizer_device
+                    audio_tokenizer_path,
+                    device_map=tokenizer_device,
+                    local_files_only=offline,
                 )
+                stage_durations["audio_tokenizer"] = time.perf_counter() - stage_started
+                stage_started = time.perf_counter()
                 model.feature_extractor = AutoFeatureExtractor.from_pretrained(
-                    audio_tokenizer_path
+                    audio_tokenizer_path,
+                    local_files_only=offline,
                 )
+                stage_durations["feature_extractor"] = time.perf_counter() - stage_started
 
                 model.sampling_rate = model.feature_extractor.sampling_rate
 
@@ -289,6 +318,19 @@ class OmniVoice(PreTrainedModel):
                     model.load_asr_model(model_name=asr_model_name)
         finally:
             logging.disable(_prev_disable)
+
+        stage_durations["total"] = time.perf_counter() - load_started
+        logger.info(
+            "[timing] OmniVoice model load: total=%.3fs resolve=%.3fs weights=%.3fs "
+            "text_tokenizer=%.3fs audio_tokenizer=%.3fs feature_extractor=%.3fs path=%s",
+            stage_durations["total"],
+            stage_durations.get("resolve_model_path", 0.0),
+            stage_durations.get("model_weights", 0.0),
+            stage_durations.get("text_tokenizer", 0.0),
+            stage_durations.get("audio_tokenizer", 0.0),
+            stage_durations.get("feature_extractor", 0.0),
+            resolved_path,
+        )
 
         return model
 

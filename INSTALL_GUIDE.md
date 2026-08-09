@@ -421,6 +421,27 @@ export HF_HUB_OFFLINE=1
 export HF_ENDPOINT="https://hf-mirror.com"
 ```
 
+### 方式四：统一初始化离线缓存（推荐）
+
+仓库提供统一脚本，覆盖 OmniVoice 主模型、audio tokenizer、FunASR `fa-zh`
+和 WhisperX 中文对齐模型。联网机器执行下载和校验：
+
+```bash
+uv run python scripts/prepare_offline_cache.py \
+    --output-manifest /data/omnivoice-cache-manifest.json
+```
+
+将缓存复制到 GPU 服务器后，只做本地校验，不会访问网络：
+
+```bash
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+uv run python scripts/prepare_offline_cache.py \
+    --check-only \
+    --output-manifest /root/digital_human/omnivoice-cache-manifest.json
+```
+
+服务器默认检查 `/root/.cache/modelscope/models/iic--speech_timestamp_prediction-v1-16k-offline/snapshots/v2.0.4` 中的 FunASR 模型，以及 `/opt/app/aining/digital_human/whisperx/models/zh` 中的 WhisperX 模型。OmniVoice 运行时只接受完整的本地 FunASR snapshot；目录或 `model.pt`、配置文件缺失时会立即报错并提示手动下载，不会自动访问 ModelScope。缓存位置不同可以设置 `MODELSCOPE_CACHE`，或通过 `--connect_aligner_model` 传入完整本地模型目录。
+
 ---
 
 ## ❓ 常见问题
