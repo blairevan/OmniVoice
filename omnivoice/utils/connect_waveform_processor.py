@@ -128,14 +128,22 @@ def process_connect_waveform(waveform: np.ndarray, sample_rate: int, boundaries:
             edits.append(BoundaryEdit(left.character, right.character, 0, False, "no_continuous_low_energy_region"))
             continue
         best = max(runs, key=lambda item: item[1] - item[0])
-        removable = min(maximum, best[1] - best[0] - residual)
+        cut_budget = max(0, maximum - fade)
+        removable = min(cut_budget, best[1] - best[0] - residual)
         if removable < minimum:
             edits.append(BoundaryEdit(left.character, right.character, 0, False, "no_continuous_low_energy_region"))
             continue
         cut_start = _crossing(analysis, best[0] + (best[1] - best[0] - removable) // 2, round(options.zero_crossing_search_ms * sample_rate / 1000))
         cut_end = _crossing(analysis, cut_start + removable, round(options.zero_crossing_search_ms * sample_rate / 1000))
         if cut_end <= cut_start: edits.append(BoundaryEdit(left.character, right.character, 0, False, "invalid_crossfade")); continue
-        fade_size = min(fade, cut_start, result.shape[-1] - cut_end)
+        if cut_end - cut_start > maximum:
+            cut_end = cut_start + maximum
+        fade_size = min(
+            fade,
+            cut_start,
+            result.shape[-1] - cut_end,
+            max(0, maximum - (cut_end - cut_start)),
+        )
         if fade_size:
             left_gain = np.cos(np.linspace(0, math.pi / 2, fade_size, dtype=np.float32))
             right_gain = np.sin(np.linspace(0, math.pi / 2, fade_size, dtype=np.float32))
@@ -144,6 +152,8 @@ def process_connect_waveform(waveform: np.ndarray, sample_rate: int, boundaries:
             removed = cut_end - cut_start + fade_size
         else:
             result = np.concatenate((result[:, :cut_start], result[:, cut_end:]), axis=1); removed = cut_end - cut_start
+        if removed > maximum:
+            raise RuntimeError("connect edit exceeded maximum_shorten_ms")
         total_removed += removed
         edits.append(BoundaryEdit(left.character, right.character, removed, True, None))
     if channels_first.shape[-1] - result.shape[-1] != total_removed or not np.isfinite(result).all():

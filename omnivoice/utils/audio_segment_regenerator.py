@@ -14,7 +14,6 @@ from typing import Callable, Sequence
 import librosa
 import numpy as np
 import soundfile as sf
-from pydub import AudioSegment
 
 from omnivoice.utils.audio import load_waveform
 from omnivoice.utils.segment_timeline import (
@@ -268,6 +267,11 @@ def _write_audio(path: Path, waveform: np.ndarray, sample_rate: int) -> None:
     if path.suffix.lower() != ".mp3":
         sf.write(path, waveform.T, sample_rate)
         return
+
+    try:
+        from pydub import AudioSegment
+    except ImportError as error:
+        raise RuntimeError("MP3 output requires pydub") from error
 
     pcm = (waveform * 32768.0).clip(-32768, 32767).astype(np.int16)
     interleaved = pcm.T.reshape(-1)

@@ -4,6 +4,7 @@ import unittest
 
 from omnivoice.utils.coherent_timeline import (
     SubtitleUnit,
+    _count_model_tokens,
     build_coherent_synthesis_groups,
     merge_coherent_units,
 )
@@ -106,6 +107,19 @@ class CoherentTimelineTests(unittest.TestCase):
 
         self.assertEqual((1, 4, 5), group.alignment_source_offsets)
         self.assertEqual(((4, 6),), group.connect_ranges)
+
+    def test_token_counter_rejects_ambiguous_tokenizer_output(self) -> None:
+        """Do not silently treat tokenizer metadata keys as token IDs."""
+        with self.assertRaisesRegex(TypeError, "input_ids"):
+            _count_model_tokens(lambda _text: {"attention_mask": [1, 1]}, "测试")
+
+    def test_token_counter_rejects_multiple_batches_for_one_string(self) -> None:
+        """Require one input string to resolve to exactly one token-ID sequence."""
+        with self.assertRaisesRegex(TypeError, "multiple batches"):
+            _count_model_tokens(
+                lambda _text: {"input_ids": [[1, 2], [3, 4]]},
+                "测试",
+            )
 
     def test_group_rejects_unit_larger_than_limit(self) -> None:
         """Never silently truncate a unit that exceeds the model limit."""

@@ -10,8 +10,11 @@ from unittest.mock import patch
 import numpy as np
 
 from omnivoice.cli.cli_infer import (
+    CONNECT_DEBUG_MARKER,
     _apply_subtitle_offset,
     _detect_active_start_seconds,
+    _prepare_connect_debug_dir,
+    _prepare_connect_debug_for_invocation,
     _reset_connect_debug_dir,
     _resolve_subtitle_offset,
     _validate_connect_debug_path,
@@ -74,6 +77,27 @@ class ConnectCliTests(unittest.TestCase):
         self.assertAlmostEqual(args.trailing_silence, 300.0)
         self.assertEqual(args.subtitle_offset, "auto")
         self.assertTrue(args.offline)
+
+    def test_whisperx_paths_do_not_use_machine_specific_defaults(self) -> None:
+        """Require explicit or environment-provided WhisperX runtime paths."""
+        with patch.dict("os.environ", {}, clear=True):
+            args = get_parser().parse_args(["--text", "中文"])
+        self.assertIsNone(args.whisperx_runtime_dir)
+        self.assertIsNone(args.whisperx_model)
+
+    def test_whisperx_paths_can_come_from_environment(self) -> None:
+        """Allow deployments to configure the isolated runtime without source edits."""
+        with patch.dict(
+            "os.environ",
+            {
+                "OMNIVOICE_WHISPERX_RUNTIME_DIR": "/runtime/whisperx",
+                "OMNIVOICE_WHISPERX_MODEL": "/models/whisperx-zh",
+            },
+            clear=False,
+        ):
+            args = get_parser().parse_args(["--text", "中文"])
+        self.assertEqual(args.whisperx_runtime_dir, "/runtime/whisperx")
+        self.assertEqual(args.whisperx_model, "/models/whisperx-zh")
 
     def test_parser_rejects_legacy_boundary_silence(self) -> None:
         """Reject the removed legacy boundary silence option."""
@@ -171,14 +195,70 @@ class ConnectCliTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 _validate_connect_debug_path(output, (output, None, None, None, None))
 
-    def test_debug_directory_is_overwritten_on_retry(self) -> None:
-        """Clear stale evidence instead of allocating a suffix directory."""
+    def test_debug_directory_cannot_contain_output(self) -> None:
+        """Reject broad directories whose recursive deletion could remove output files."""
+        with tempfile.TemporaryDirectory() as directory:
+            output = str(Path(directory) / "output.wav")
+            with self.assertRaises(ValueError):
+                _validate_connect_debug_path(directory, (output, None, None, None, None))
+
+    def test_non_connect_invocation_does_not_create_debug_directory(self) -> None:
+        """Do no debug-directory I/O when the invocation contains no connect markup."""
+        with tempfile.TemporaryDirectory() as directory:
+            debug_dir = Path(directory) / "unused-debug"
+            args = SimpleNamespace(
+                connect_debug_dir=str(debug_dir),
+                output=str(Path(directory) / "output.wav"),
+                srt=None,
+                json_subtitle=None,
+                source_audio=None,
+                source_subtitle=None,
+            )
+            _prepare_connect_debug_for_invocation(args, uses_connect=False)
+            self.assertIsNone(args.connect_debug_dir)
+            self.assertFalse(debug_dir.exists())
+
+    def test_connect_invocation_creates_marked_default_debug_directory(self) -> None:
+        """Create persistent evidence only when connect markup is actually used."""
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "output.wav"
+            args = SimpleNamespace(
+                connect_debug_dir=None,
+                output=str(output),
+                srt=None,
+                json_subtitle=None,
+                source_audio=None,
+                source_subtitle=None,
+            )
+            _prepare_connect_debug_for_invocation(args, uses_connect=True)
+            debug_dir = Path(args.connect_debug_dir)
+            self.assertEqual(debug_dir, Path(directory) / "output_connect_debug")
+            self.assertTrue((debug_dir / CONNECT_DEBUG_MARKER).is_file())
+
+    def test_unowned_debug_directory_is_never_deleted(self) -> None:
+        """Refuse to recursively delete a directory without the OmniVoice marker."""
+        with tempfile.TemporaryDirectory() as directory:
+            debug_dir = Path(directory) / "important-data"
+            debug_dir.mkdir()
+            important = debug_dir / "keep.txt"
+            important.write_text("keep", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "unowned"):
+                _reset_connect_debug_dir(str(debug_dir))
+            self.assertEqual("keep", important.read_text(encoding="utf-8"))
+
+    def test_debug_directory_is_safely_overwritten_on_retry(self) -> None:
+        """Clear only marked stale evidence and recreate an owned debug directory."""
         with tempfile.TemporaryDirectory() as directory:
             first = Path(directory) / "output_connect_debug"
             first.mkdir()
+            (first / CONNECT_DEBUG_MARKER).write_text(
+                "omnivoice-connect-debug\n", encoding="utf-8"
+            )
             (first / "stale.json").write_text("stale", encoding="utf-8")
-            _reset_connect_debug_dir(str(first))
-            self.assertFalse(first.exists())
+            _prepare_connect_debug_dir(str(first))
+            self.assertTrue(first.is_dir())
+            self.assertTrue((first / CONNECT_DEBUG_MARKER).is_file())
+            self.assertFalse((first / "stale.json").exists())
 
     def test_model_token_limit_is_used_when_exposed(self) -> None:
         """Prefer a finite tokenizer limit over an implicit character guess."""

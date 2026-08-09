@@ -35,7 +35,6 @@ import argparse
 import logging
 import multiprocessing as mp
 import os
-import signal
 import time
 import traceback
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -449,6 +448,7 @@ def main():
 
     total_synthesis_time = []
     total_audio_duration = []
+    failed_batches = 0
 
     try:
         with ProcessPoolExecutor(
@@ -508,17 +508,22 @@ def main():
                             f"Synthesis Time={synth_time:.2f}s, RTF={rtf:.4f}"
                         )
                 except Exception as e:
-                    logging.error(f"Failed to process sample: {e}")
+                    failed_batches += 1
+                    logging.error(f"Failed to process batch: {e}")
                     detailed_error = traceback.format_exc()
                     logging.error(f"Detailed error: {detailed_error}")
 
-    except (Exception, KeyboardInterrupt) as e:
-        logging.critical(
-            f"An unrecoverable error occurred: {e}. Terminating all processes."
-        )
+        if failed_batches:
+            raise RuntimeError(f"{failed_batches} inference batch(es) failed")
+
+    except KeyboardInterrupt as e:
+        logging.critical("Batch inference interrupted; shutting down workers safely.")
+        raise SystemExit(130) from e
+    except Exception as e:
+        logging.critical(f"Batch inference failed: {e}")
         detailed_error_info = traceback.format_exc()
         logging.error(f"--- DETAILED TRACEBACK ---\n{detailed_error_info}")
-        os.killpg(os.getpgid(os.getpid()), signal.SIGKILL)
+        raise SystemExit(1) from e
 
     total_synthesis_time = sum(total_synthesis_time)
     total_audio_duration = sum(total_audio_duration)

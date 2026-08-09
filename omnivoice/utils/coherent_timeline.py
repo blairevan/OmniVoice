@@ -110,6 +110,49 @@ def merge_coherent_units(
     )
 
 
+def _count_model_tokens(tokenizer: TokenCounter | object | None, text: str) -> int | None:
+    """Count tokens from supported tokenizer result shapes or fail explicitly."""
+    if tokenizer is None:
+        return None
+
+    tokenize = getattr(tokenizer, "tokenize", None)
+    if callable(tokenize):
+        tokens = tokenize(text)
+        if isinstance(tokens, (str, bytes, dict)) or not hasattr(tokens, "__len__"):
+            raise TypeError("tokenizer.tokenize() must return a sized token sequence")
+        return len(tokens)
+
+    if not callable(tokenizer):
+        raise TypeError("tokenizer must be callable or expose tokenize()")
+
+    encoded = tokenizer(text)
+    input_ids = (
+        encoded.get("input_ids")
+        if isinstance(encoded, dict)
+        else getattr(encoded, "input_ids", None)
+    )
+    if input_ids is None:
+        if isinstance(encoded, (list, tuple)):
+            input_ids = encoded
+        else:
+            raise TypeError(
+                "callable tokenizer must return input_ids or a token ID sequence"
+            )
+    if hasattr(input_ids, "tolist"):
+        input_ids = input_ids.tolist()
+    if not isinstance(input_ids, (list, tuple)):
+        raise TypeError("tokenizer input_ids must be a list, tuple, or tensor-like value")
+    if not input_ids:
+        return 0
+    if isinstance(input_ids[0], (list, tuple)):
+        if len(input_ids) != 1:
+            raise TypeError("tokenizer returned multiple batches for one input string")
+        return len(input_ids[0])
+    if any(isinstance(item, (list, tuple, dict)) for item in input_ids):
+        raise TypeError("tokenizer returned an inconsistent input_ids structure")
+    return len(input_ids)
+
+
 def build_coherent_synthesis_groups(
     units: Sequence[SubtitleUnit],
     tokenizer: TokenCounter | object | None,
@@ -124,32 +167,9 @@ def build_coherent_synthesis_groups(
     if max_synthesis_chars <= 0:
         raise ValueError("max_synthesis_chars must be positive")
 
-    def token_count(text: str) -> int | None:
-        """Return the model token count without mistaking tokenizer metadata for tokens."""
-        if tokenizer is None:
-            return None
-        tokenize = getattr(tokenizer, "tokenize", None)
-        if callable(tokenize):
-            return len(tokenize(text))
-        if not callable(tokenizer):
-            raise TypeError("tokenizer must be callable or expose tokenize()")
-        encoded = tokenizer(text)
-        input_ids = (
-            encoded.get("input_ids")
-            if isinstance(encoded, dict)
-            else getattr(encoded, "input_ids", None)
-        )
-        if input_ids is None:
-            return len(encoded)
-        if hasattr(input_ids, "tolist"):
-            input_ids = input_ids.tolist()
-        if input_ids and isinstance(input_ids[0], (list, tuple)):
-            return len(input_ids[0])
-        return len(input_ids)
-
     def exceeds(group: CoherentSynthesisGroup) -> bool:
         """Check both configured safety limits for one candidate group."""
-        measured_tokens = token_count(group.synthesis_text)
+        measured_tokens = _count_model_tokens(tokenizer, group.synthesis_text)
         if measured_tokens is not None:
             return measured_tokens > max_tokens
         return len(group.synthesis_text) > max_synthesis_chars

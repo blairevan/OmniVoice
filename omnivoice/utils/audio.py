@@ -24,6 +24,8 @@ All public functions in this module operate on **numpy float32 arrays**
 with shape ``(C, T)`` (channels-first).
 """
 
+from __future__ import annotations
+
 import io
 import logging
 
@@ -31,10 +33,24 @@ import numpy as np
 import soundfile as sf
 import torch
 import torchaudio
-from pydub import AudioSegment
-from pydub.silence import detect_leading_silence, detect_nonsilent, split_on_silence
 
 logger = logging.getLogger(__name__)
+
+
+def _load_pydub():
+    """Load pydub only for operations that actually need it."""
+    try:
+        from pydub import AudioSegment
+        from pydub.silence import (
+            detect_leading_silence,
+            detect_nonsilent,
+            split_on_silence,
+        )
+    except ImportError as error:
+        raise RuntimeError(
+            "pydub is required for silence processing and AudioSegment conversion"
+        ) from error
+    return AudioSegment, detect_leading_silence, detect_nonsilent, split_on_silence
 
 
 # ---------------------------------------------------------------------------
@@ -128,6 +144,7 @@ def load_audio_bytes(raw: bytes, sampling_rate: int) -> np.ndarray:
 
 def numpy_to_audiosegment(audio: np.ndarray, sample_rate: int) -> AudioSegment:
     """Convert a numpy float32 array of shape (C, T) to a pydub AudioSegment."""
+    AudioSegment, _, _, _ = _load_pydub()
     audio_int = (audio * 32768.0).clip(-32768, 32767).astype(np.int16)
     if audio_int.shape[0] > 1:
         audio_int = audio_int.T.flatten()  # interleave channels
@@ -167,6 +184,7 @@ def remove_silence(
         Numpy array with shape (C, T').
     """
     wave = numpy_to_audiosegment(audio, sampling_rate)
+    AudioSegment, _, _, split_on_silence = _load_pydub()
 
     if mid_sil > 0:
         non_silent_segs = split_on_silence(
@@ -192,6 +210,7 @@ def remove_silence_edges(
     silence_threshold: float = -50,
 ) -> AudioSegment:
     """Remove edge silences, keeping *lead_sil* / *trail_sil* ms."""
+    _, detect_leading_silence, _, _ = _load_pydub()
     start_idx = detect_leading_silence(audio, silence_threshold=silence_threshold)
     start_idx = max(0, start_idx - lead_sil)
     audio = audio[start_idx:]
@@ -275,6 +294,7 @@ def trim_long_audio(
         return audio
 
     seg = numpy_to_audiosegment(audio, sampling_rate)
+    _, _, detect_nonsilent, _ = _load_pydub()
     nonsilent = detect_nonsilent(
         seg, min_silence_len=100, silence_thresh=-40, seek_step=10
     )

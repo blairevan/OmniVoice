@@ -990,13 +990,13 @@ class OmniVoice(PreTrainedModel):
                 "ref_text/ref_audio will be ignored."
             )
         if voice_clone_prompt is None and ref_audio is not None:
-            # If voice_clone_prompt is not provided, create it from
-            # ref_audio (ref_text will be auto-transcribed if not given).
-            ref_text_list = self._ensure_list(ref_text, batch_size, auto_repeat=False)
-            ref_audio_list = self._ensure_list(ref_audio, batch_size, auto_repeat=False)
+            # Broadcast scalar reference inputs across the batch so ref_text and
+            # ref_audio always have one entry per synthesis item.
+            ref_text_list = self._ensure_list(ref_text, batch_size)
+            ref_audio_list = self._ensure_list(ref_audio, batch_size)
 
             voice_clone_prompt = []
-            for i in range(len(ref_text_list)):
+            for i in range(batch_size):
                 voice_clone_prompt.append(
                     self.create_voice_clone_prompt(
                         ref_audio=ref_audio_list[i],

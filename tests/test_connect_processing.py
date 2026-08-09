@@ -7,7 +7,11 @@ from pathlib import Path
 
 import numpy as np
 
-from omnivoice.utils.connect_candidate_selector import CharacterTimestamp, internal_boundaries
+from omnivoice.utils.connect_candidate_selector import (
+    CandidateScore,
+    CharacterTimestamp,
+    internal_boundaries,
+)
 from omnivoice.utils.connect_markup import parse_connect_markup, split_connect_markup
 from omnivoice.utils.connect_waveform_processor import (
     ConnectProcessingOptions,
@@ -15,6 +19,7 @@ from omnivoice.utils.connect_waveform_processor import (
 )
 from omnivoice.utils.connect_candidate_pipeline import (
     ConnectRuntimeOptions,
+    _filter_candidate_versions,
     _normalize_funasr_timestamps,
     _resolve_local_funasr_model_path,
     select_connect_waveform,
@@ -84,6 +89,7 @@ class ConnectWaveformTests(unittest.TestCase):
             ConnectProcessingOptions(maximum_shorten_ms=80, boundary_guard_ms=20, minimum_low_energy_ms=30, residual_gap_ms=20, crossfade_ms=8),
         )
         self.assertGreater(result.total_removed_samples, 0)
+        self.assertLessEqual(result.total_removed_samples, 80)
         self.assertEqual(waveform.size - result.total_removed_samples, result.waveform.size)
 
     def test_processor_preserves_protected_gap(self) -> None:
@@ -132,6 +138,37 @@ class ConnectPipelineTests(unittest.TestCase):
         with patch.dict("os.environ", {"MODELSCOPE_CACHE": directory}, clear=False):
             with self.assertRaisesRegex(RuntimeError, "Runtime download is disabled"):
                 _resolve_local_funasr_model_path("fa-zh")
+
+    def test_final_quality_filter_does_not_recheck_original(self) -> None:
+        """Only processed variants need the second-stage quality check."""
+        waveform = np.ones(100, dtype=np.float32) * 0.2
+        original = (
+            CandidateScore(1, "original", 0.0, 0.0, 0.0, 0.0, 0),
+            waveform,
+            0,
+        )
+        processed = (
+            CandidateScore(1, "processed", 0.0, 0.0, 0.0, 0.0, 5),
+            waveform[:-5],
+            5,
+        )
+        reports = [{"candidateIndex": 1, "accepted": False, "rejections": []}]
+
+        with patch(
+            "omnivoice.utils.connect_candidate_pipeline._waveform_quality_reasons",
+            return_value=[],
+        ) as quality_check:
+            accepted = _filter_candidate_versions(
+                [original, processed],
+                reports,
+                sample_rate=1_000,
+                duration_median=0.1,
+                rms_median=-14.0,
+            )
+
+        self.assertEqual([original, processed], accepted)
+        quality_check.assert_called_once()
+        self.assertTrue(reports[0]["accepted"])
 
     def test_pipeline_persists_original_alignment_and_selection(self) -> None:
         """Keep candidate evidence when an explicit debug directory is supplied."""

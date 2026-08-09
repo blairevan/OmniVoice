@@ -1,9 +1,11 @@
 """Tests for subtitle-aligned audio segment regeneration."""
 
+import builtins
 import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import soundfile as sf
@@ -24,7 +26,31 @@ from omnivoice.utils.audio_segment_regenerator import (
     validate_regeneration_paths,
     _choose_overlap_lengths,
     _overlap_add,
+    _write_audio,
 )
+
+
+class AudioWriteTests(unittest.TestCase):
+    """Verify ordinary audio publication does not import MP3-only helpers."""
+
+    def test_wav_write_does_not_require_pydub(self) -> None:
+        """Keep WAV regeneration usable when pydub is unavailable."""
+        real_import = builtins.__import__
+
+        def fail_pydub(name, *args, **kwargs):
+            if name == "pydub" or name.startswith("pydub."):
+                raise ImportError("pydub unavailable")
+            return real_import(name, *args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "output.wav"
+            with patch("builtins.__import__", side_effect=fail_pydub):
+                _write_audio(
+                    output,
+                    np.zeros((1, 100), dtype=np.float32),
+                    1_000,
+                )
+            self.assertTrue(output.is_file())
 
 
 class ParserTests(unittest.TestCase):

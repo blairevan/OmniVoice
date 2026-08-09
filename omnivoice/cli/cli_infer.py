@@ -935,10 +935,24 @@ def get_parser() -> argparse.ArgumentParser:
     parser.add_argument("--leading_silence", type=float, default=300.0, help="Silence in milliseconds added before normal output")
     parser.add_argument("--trailing_silence", type=float, default=300.0, help="Silence in milliseconds added after normal output")
     parser.add_argument("--subtitle_offset", type=str, default="auto", help="Subtitle offset in milliseconds, or auto")
-    parser.add_argument("--whisperx_runtime_dir", default="/opt/app/aining/digital_human/whisperx", help="Shared offline WhisperX runtime directory")
+    parser.add_argument(
+        "--whisperx_runtime_dir",
+        default=os.environ.get("OMNIVOICE_WHISPERX_RUNTIME_DIR"),
+        help=(
+            "Shared offline WhisperX runtime directory. Defaults to "
+            "OMNIVOICE_WHISPERX_RUNTIME_DIR when set."
+        ),
+    )
     parser.add_argument("--whisperx_language", default="zh", help="WhisperX alignment language")
     parser.add_argument("--whisperx_device", choices=("cuda",), default="cuda", help="WhisperX device")
-    parser.add_argument("--whisperx_model", default="/opt/app/aining/digital_human/whisperx/models/zh", help="Local WhisperX alignment model directory")
+    parser.add_argument(
+        "--whisperx_model",
+        default=os.environ.get("OMNIVOICE_WHISPERX_MODEL"),
+        help=(
+            "Local WhisperX alignment model directory. Defaults to "
+            "OMNIVOICE_WHISPERX_MODEL when set."
+        ),
+    )
     parser.add_argument("--whisperx_timeout_seconds", type=float, default=10800.0, help="Total WhisperX alignment deadline in seconds")
 
     return parser
@@ -994,7 +1008,17 @@ def _run_regeneration(
     alignment_requested = bool(args.srt or args.json_subtitle) and any(
         isinstance(request.text, list) and len(request.text) > 1 for request in requests
     )
-    alignment_state: dict[str, object] = {"enabled": alignment_requested}
+    whisperx_configured = bool(args.whisperx_runtime_dir and args.whisperx_model)
+    alignment_state: dict[str, object] = {
+        "enabled": alignment_requested and whisperx_configured
+    }
+    if alignment_requested and not whisperx_configured:
+        alignment_state["failure_reason"] = "whisperx_not_configured"
+        logger.warning(
+            "WhisperX alignment is unavailable; configure --whisperx_runtime_dir "
+            "and --whisperx_model (or OMNIVOICE_WHISPERX_RUNTIME_DIR / "
+            "OMNIVOICE_WHISPERX_MODEL). Falling back to generated timing."
+        )
     whisperx_aligner = (
         WhisperXAligner(
             args.whisperx_runtime_dir,
@@ -1002,7 +1026,7 @@ def _run_regeneration(
             args.whisperx_device,
             args.whisperx_model,
         )
-        if alignment_requested
+        if alignment_state["enabled"]
         else None
     )
     whisperx_deadline: WhisperXAlignmentDeadline | None = None
@@ -1067,7 +1091,7 @@ def _run_regeneration(
     def release_before_alignment() -> None:
         """Release TTS GPU memory before starting any WhisperX process."""
         nonlocal whisperx_deadline
-        if not alignment_requested:
+        if not alignment_requested or whisperx_aligner is None:
             return
         result = release_tts_gpu_runtime(model)
         alignment_state["enabled"] = result.released
@@ -1125,28 +1149,109 @@ def _run_regeneration(
     )
 
 
+CONNECT_DEBUG_MARKER = ".omnivoice_connect_debug"
+
+
 def _validate_connect_debug_path(
     debug_dir: str,
     paths: tuple[str | None, ...],
 ) -> None:
-    """Reject debug directories that collide with formal inputs or outputs."""
-    debug_path = Path(debug_dir).resolve()
+    """Reject debug directories that could contain formal inputs or outputs."""
+    debug_path = Path(debug_dir).expanduser().resolve()
+    if debug_path in {Path(debug_path.anchor), Path.home().resolve()}:
+        raise ValueError("Connect debug directory points to a protected root directory")
+
     resolved_paths = {
-        Path(value).resolve()
+        Path(value).expanduser().resolve()
         for value in paths
         if value
     }
-    if debug_path in resolved_paths:
-        raise ValueError("Connect debug directory must not match an input or output path")
+    for resolved_path in resolved_paths:
+        if resolved_path == debug_path or resolved_path.is_relative_to(debug_path):
+            raise ValueError(
+                "Connect debug directory must not match or contain an input/output path"
+            )
 
 
 def _reset_connect_debug_dir(debug_dir: str) -> None:
-    """Remove prior connect evidence so the current task can overwrite it."""
-    debug_path = Path(debug_dir)
-    if debug_path.exists():
-        if not debug_path.is_dir():
-            raise ValueError(f"Connect debug path is not a directory: {debug_dir}")
-        shutil.rmtree(debug_path)
+    """Remove only a debug directory previously created by this CLI."""
+    debug_path = Path(debug_dir).expanduser()
+    if not debug_path.exists():
+        return
+    if debug_path.is_symlink() or not debug_path.is_dir():
+        raise ValueError(f"Connect debug path is not a safe directory: {debug_dir}")
+    resolved_path = debug_path.resolve()
+    if resolved_path in {Path(resolved_path.anchor), Path.home().resolve()}:
+        raise ValueError("Refusing to delete a protected root directory")
+    marker = debug_path / CONNECT_DEBUG_MARKER
+    try:
+        marker_value = marker.read_text(encoding="utf-8").strip()
+    except OSError:
+        marker_value = ""
+    if marker.is_symlink() or marker_value != "omnivoice-connect-debug":
+        raise ValueError(
+            "Refusing to delete an existing unowned connect debug directory: "
+            f"{debug_dir}"
+        )
+    shutil.rmtree(debug_path)
+
+
+def _prepare_connect_debug_dir(debug_dir: str) -> None:
+    """Safely replace prior evidence and mark the newly owned debug directory."""
+    _reset_connect_debug_dir(debug_dir)
+    debug_path = Path(debug_dir).expanduser()
+    debug_path.mkdir(parents=True, exist_ok=False)
+    (debug_path / CONNECT_DEBUG_MARKER).write_text("omnivoice-connect-debug\n", encoding="utf-8")
+
+
+def _actions_use_connect(
+    actions: Sequence[tuple[str, str]],
+    markup_version: str | None,
+) -> bool:
+    """Return whether parsed synthesis actions contain connect markup."""
+    return any(
+        action_type == "text" and bool(parse_connect_markup(value, markup_version).ranges)
+        for action_type, value in actions
+    )
+
+
+def _regeneration_requests_use_connect(
+    requests: Sequence[ReplacementRequest],
+    markup_version: str | None,
+) -> bool:
+    """Return whether any regeneration request will invoke the connect pipeline."""
+    for request in requests:
+        text = "".join(request.text) if isinstance(request.text, list) else request.text
+        actions = parse_text_actions(text, markup_version=markup_version)
+        if _actions_use_connect(actions, markup_version):
+            return True
+    return False
+
+
+def _prepare_connect_debug_for_invocation(
+    args: argparse.Namespace,
+    uses_connect: bool,
+) -> None:
+    """Prepare persistent connect evidence only when connect markup is present."""
+    if not uses_connect:
+        args.connect_debug_dir = None
+        return
+    if args.connect_debug_dir is None:
+        output_path = Path(args.output)
+        args.connect_debug_dir = str(
+            output_path.parent / f"{output_path.stem}_connect_debug"
+        )
+    _validate_connect_debug_path(
+        args.connect_debug_dir,
+        (
+            args.output,
+            args.srt,
+            args.json_subtitle,
+            args.source_audio,
+            args.source_subtitle,
+        ),
+    )
+    _prepare_connect_debug_dir(args.connect_debug_dir)
 
 
 def _resolve_model_token_limit(model: OmniVoice) -> int | None:
@@ -1178,28 +1283,7 @@ def main():
     if args.offline:
         os.environ["HF_HUB_OFFLINE"] = "1"
         os.environ["TRANSFORMERS_OFFLINE"] = "1"
-    if args.connect_debug_dir is None:
-        output_path = Path(args.output)
-        args.connect_debug_dir = str(
-            output_path.parent / f"{output_path.stem}_connect_debug"
-        )
-    try:
-        _validate_connect_debug_path(
-            args.connect_debug_dir,
-            (
-                args.output,
-                args.srt,
-                args.json_subtitle,
-                args.source_audio,
-                args.source_subtitle,
-            ),
-        )
-    except ValueError as error:
-        parser.error(str(error))
-    try:
-        _reset_connect_debug_dir(args.connect_debug_dir)
-    except (OSError, ValueError) as error:
-        parser.error(str(error))
+    actions: Sequence[tuple[str, str]] | None = None
     try:
         mode = resolve_cli_mode(
             args.text,
@@ -1212,6 +1296,20 @@ def main():
         regeneration_inputs = (
             _prepare_regeneration(args) if mode == "regeneration" else None
         )
+        if mode == "regeneration":
+            if regeneration_inputs is None:
+                raise RuntimeError("Regeneration inputs were not prepared")
+            uses_connect = _regeneration_requests_use_connect(
+                regeneration_inputs[1], args.markup_version
+            )
+        else:
+            actions = parse_text_actions(args.text, markup_version=args.markup_version)
+            uses_connect = _actions_use_connect(actions, args.markup_version)
+    except (OSError, RuntimeError, ValueError) as error:
+        parser.error(str(error))
+
+    try:
+        _prepare_connect_debug_for_invocation(args, uses_connect)
     except (OSError, ValueError) as error:
         parser.error(str(error))
 
@@ -1269,8 +1367,10 @@ def main():
 
     logger.info(f"   Text: {args.text}")
 
-    # Parse markup into actions
-    actions = parse_text_actions(args.text, markup_version=args.markup_version)
+    # Actions were parsed before model loading so connect evidence is prepared
+    # only when the invocation actually contains connect markup.
+    if actions is None:
+        raise RuntimeError("Synthesis actions were not prepared")
     logger.info(f"   Parsed {len(actions)} action(s): {actions}")
 
     max_tokens = args.max_forced_segment_tokens or model_token_limit or args.max_char_len * 3
@@ -1311,23 +1411,31 @@ def main():
         deadline = None
         release_result = None
         if has_multi_sentence_group:
-            aligner = WhisperXAligner(
-                args.whisperx_runtime_dir,
-                args.whisperx_language,
-                args.whisperx_device,
-                args.whisperx_model,
-            )
-            deadline = WhisperXAlignmentDeadline.from_timeout_seconds(
-                args.whisperx_timeout_seconds
-            )
-            release_result = release_tts_gpu_runtime(model)
-            if not release_result.released:
-                logger.warning(
-                    "Skipping WhisperX because TTS GPU release failed: %s",
-                    release_result.reason,
+            if args.whisperx_runtime_dir and args.whisperx_model:
+                aligner = WhisperXAligner(
+                    args.whisperx_runtime_dir,
+                    args.whisperx_language,
+                    args.whisperx_device,
+                    args.whisperx_model,
                 )
-                aligner = None
-                deadline = None
+                deadline = WhisperXAlignmentDeadline.from_timeout_seconds(
+                    args.whisperx_timeout_seconds
+                )
+                release_result = release_tts_gpu_runtime(model)
+                if not release_result.released:
+                    logger.warning(
+                        "Skipping WhisperX because TTS GPU release failed: %s",
+                        release_result.reason,
+                    )
+                    aligner = None
+                    deadline = None
+            else:
+                logger.warning(
+                    "WhisperX alignment is not configured; falling back to generated "
+                    "timing. Set --whisperx_runtime_dir and --whisperx_model, or the "
+                    "OMNIVOICE_WHISPERX_RUNTIME_DIR / OMNIVOICE_WHISPERX_MODEL "
+                    "environment variables."
+                )
         timestamps = resolve_generated_group_timings(generated, aligner, deadline)
         logger.info(
             "[timing] subtitle alignment/timeline: %.3fs subtitles=%d whisperx=%s",

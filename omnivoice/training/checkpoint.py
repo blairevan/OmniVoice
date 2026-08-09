@@ -28,6 +28,7 @@ Key components:
 
 import logging
 import os
+import re
 import shutil
 import time
 from typing import Any, Dict, Optional
@@ -148,20 +149,18 @@ def save_checkpoint(
 
     # 4. Rotate checkpoints (Keep last N)
     if accelerator.is_main_process and keep_last_n > 0:
-        checkpoints = [
-            d
-            for d in os.listdir(output_dir)
-            if d.startswith("checkpoint-")
-            and os.path.isdir(os.path.join(output_dir, d))
-        ]
-        # Sort by step number
-        checkpoints.sort(key=lambda x: int(x.split("-")[-1]))
+        checkpoints = []
+        for directory in os.listdir(output_dir):
+            match = re.fullmatch(r"checkpoint-(\d+)", directory)
+            if match and os.path.isdir(os.path.join(output_dir, directory)):
+                checkpoints.append((int(match.group(1)), directory))
+        checkpoints.sort(key=lambda item: item[0])
 
         if len(checkpoints) > keep_last_n:
             to_remove = checkpoints[:-keep_last_n]
-            for d in to_remove:
-                shutil.rmtree(os.path.join(output_dir, d))
-                logger.info(f"Removed old checkpoint {d}")
+            for _, directory in to_remove:
+                shutil.rmtree(os.path.join(output_dir, directory))
+                logger.info(f"Removed old checkpoint {directory}")
 
 
 def load_checkpoint(accelerator: Accelerator, checkpoint_path: str):

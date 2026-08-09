@@ -228,13 +228,20 @@ class OmniTrainer:
                 local_loss_sum += outputs.loss.detach()
                 eval_count += 1
 
-        if eval_count > 0:
-            local_mean = local_loss_sum / eval_count
-        else:
-            local_mean = torch.tensor(0.0, device=self.accelerator.device)
-
-        all_means = self.accelerator.gather(local_mean)
-        final_eval_loss = all_means.mean().item()
+        local_stats = torch.stack(
+            (
+                local_loss_sum,
+                torch.tensor(float(eval_count), device=self.accelerator.device),
+            )
+        )
+        all_stats = self.accelerator.gather(local_stats).reshape(-1, 2)
+        global_loss_sum = all_stats[:, 0].sum()
+        global_eval_count = all_stats[:, 1].sum()
+        final_eval_loss = (
+            (global_loss_sum / global_eval_count).item()
+            if global_eval_count.item() > 0
+            else 0.0
+        )
 
         eval_metrics = {"eval/loss": final_eval_loss}
         self.accelerator.log(eval_metrics, step=self.global_step)
