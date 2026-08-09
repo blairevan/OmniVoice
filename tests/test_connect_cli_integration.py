@@ -25,6 +25,7 @@ from omnivoice.cli.cli_infer import (
 )
 from omnivoice.models.omnivoice import _resolve_model_path
 from omnivoice.utils.connect_candidate_pipeline import ConnectRuntimeOptions
+from omnivoice.utils.runtime_config import WhisperXRuntimeConfig
 from omnivoice.utils.synthesis_orchestrator import (
     generate_coherent_actions,
     resolve_generated_group_timings,
@@ -78,26 +79,69 @@ class ConnectCliTests(unittest.TestCase):
         self.assertEqual(args.subtitle_offset, "auto")
         self.assertTrue(args.offline)
 
-    def test_whisperx_paths_do_not_use_machine_specific_defaults(self) -> None:
-        """Require explicit or environment-provided WhisperX runtime paths."""
-        with patch.dict("os.environ", {}, clear=True):
+    def test_whisperx_paths_come_from_yaml(self) -> None:
+        """Use repository YAML when no higher-priority source supplies paths."""
+        yaml_config = WhisperXRuntimeConfig(
+            runtime_dir="/yaml/runtime",
+            model_dir="/yaml/models/zh",
+        )
+        with patch.dict("os.environ", {}, clear=True), patch(
+            "omnivoice.cli.cli_infer.load_whisperx_runtime_config",
+            return_value=yaml_config,
+        ):
             args = get_parser().parse_args(["--text", "中文"])
-        self.assertIsNone(args.whisperx_runtime_dir)
-        self.assertIsNone(args.whisperx_model)
+        self.assertEqual(args.whisperx_runtime_dir, "/yaml/runtime")
+        self.assertEqual(args.whisperx_model, "/yaml/models/zh")
 
-    def test_whisperx_paths_can_come_from_environment(self) -> None:
-        """Allow deployments to configure the isolated runtime without source edits."""
+    def test_whisperx_environment_overrides_yaml(self) -> None:
+        """Let each existing environment value override its YAML counterpart."""
+        yaml_config = WhisperXRuntimeConfig(
+            runtime_dir="/yaml/runtime",
+            model_dir="/yaml/models/zh",
+        )
         with patch.dict(
             "os.environ",
             {
                 "OMNIVOICE_WHISPERX_RUNTIME_DIR": "/runtime/whisperx",
-                "OMNIVOICE_WHISPERX_MODEL": "/models/whisperx-zh",
             },
-            clear=False,
+            clear=True,
+        ), patch(
+            "omnivoice.cli.cli_infer.load_whisperx_runtime_config",
+            return_value=yaml_config,
         ):
             args = get_parser().parse_args(["--text", "中文"])
         self.assertEqual(args.whisperx_runtime_dir, "/runtime/whisperx")
-        self.assertEqual(args.whisperx_model, "/models/whisperx-zh")
+        self.assertEqual(args.whisperx_model, "/yaml/models/zh")
+
+    def test_whisperx_cli_overrides_environment_and_yaml(self) -> None:
+        """Keep explicit diagnostic paths above every default source."""
+        yaml_config = WhisperXRuntimeConfig(
+            runtime_dir="/yaml/runtime",
+            model_dir="/yaml/models/zh",
+        )
+        with patch.dict(
+            "os.environ",
+            {
+                "OMNIVOICE_WHISPERX_RUNTIME_DIR": "/env/runtime",
+                "OMNIVOICE_WHISPERX_MODEL": "/env/models/zh",
+            },
+            clear=True,
+        ), patch(
+            "omnivoice.cli.cli_infer.load_whisperx_runtime_config",
+            return_value=yaml_config,
+        ):
+            args = get_parser().parse_args(
+                [
+                    "--text",
+                    "中文",
+                    "--whisperx_runtime_dir",
+                    "/cli/runtime",
+                    "--whisperx_model",
+                    "/cli/models/zh",
+                ]
+            )
+        self.assertEqual(args.whisperx_runtime_dir, "/cli/runtime")
+        self.assertEqual(args.whisperx_model, "/cli/models/zh")
 
     def test_parser_rejects_legacy_boundary_silence(self) -> None:
         """Reject the removed legacy boundary silence option."""

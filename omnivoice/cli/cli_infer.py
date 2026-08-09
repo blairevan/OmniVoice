@@ -79,6 +79,7 @@ from omnivoice.utils.connect_candidate_pipeline import (
 from omnivoice.utils.connect_markup import parse_connect_markup, split_connect_markup
 from omnivoice.utils.connect_waveform_processor import ConnectProcessingOptions
 from omnivoice.utils.gpu_runtime import release_tts_gpu_runtime
+from omnivoice.utils.runtime_config import load_whisperx_runtime_config
 from omnivoice.utils.synthesis_orchestrator import (
     generate_coherent_actions,
     resolve_generated_group_timings,
@@ -775,6 +776,15 @@ def save_audio(audio, sample_rate, output_path):
 
 def get_parser() -> argparse.ArgumentParser:
     """Build argument parser for the advanced inference CLI."""
+    whisperx_config = load_whisperx_runtime_config()
+    whisperx_runtime_default = (
+        os.environ.get("OMNIVOICE_WHISPERX_RUNTIME_DIR")
+        or whisperx_config.runtime_dir
+    )
+    whisperx_model_default = (
+        os.environ.get("OMNIVOICE_WHISPERX_MODEL")
+        or whisperx_config.model_dir
+    )
     parser = argparse.ArgumentParser(
         description="OmniVoice markup inference and audio segment regeneration",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -937,20 +947,20 @@ def get_parser() -> argparse.ArgumentParser:
     parser.add_argument("--subtitle_offset", type=str, default="auto", help="Subtitle offset in milliseconds, or auto")
     parser.add_argument(
         "--whisperx_runtime_dir",
-        default=os.environ.get("OMNIVOICE_WHISPERX_RUNTIME_DIR"),
+        default=whisperx_runtime_default,
         help=(
-            "Shared offline WhisperX runtime directory. Defaults to "
-            "OMNIVOICE_WHISPERX_RUNTIME_DIR when set."
+            "Shared offline WhisperX runtime directory. Defaults to the "
+            "environment or repository config.yaml value when set."
         ),
     )
     parser.add_argument("--whisperx_language", default="zh", help="WhisperX alignment language")
     parser.add_argument("--whisperx_device", choices=("cuda",), default="cuda", help="WhisperX device")
     parser.add_argument(
         "--whisperx_model",
-        default=os.environ.get("OMNIVOICE_WHISPERX_MODEL"),
+        default=whisperx_model_default,
         help=(
-            "Local WhisperX alignment model directory. Defaults to "
-            "OMNIVOICE_WHISPERX_MODEL when set."
+            "Local WhisperX alignment model directory. Defaults to the "
+            "environment or repository config.yaml value when set."
         ),
     )
     parser.add_argument("--whisperx_timeout_seconds", type=float, default=10800.0, help="Total WhisperX alignment deadline in seconds")

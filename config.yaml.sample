@@ -1,0 +1,3 @@
+whisperx:
+  runtime_dir: /root/digital_human/whisperx
+  model_dir: /root/digital_human/whisperx/models/zh

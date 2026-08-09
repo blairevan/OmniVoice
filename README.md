@@ -324,12 +324,13 @@ subtitle output (`--srt` or `--json_subtitle`) is required.
 
 When multi-sentence subtitles are requested, OmniVoice first generates all TTS
 groups, releases the TTS GPU runtime, and then invokes the shared offline
-WhisperX runtime on CUDA. The defaults are
-`/opt/app/aining/digital_human/whisperx`, the local Chinese model at
-`/opt/app/aining/digital_human/whisperx/models/zh`, and a three-hour total
-alignment deadline. Use `--whisperx_runtime_dir`, `--whisperx_model`,
-`--whisperx_language`, `--whisperx_device cuda`, and
-`--whisperx_timeout_seconds` to override the runtime settings. Alignment
+WhisperX runtime on CUDA. Repository-root `config.yaml` supplies the deployment
+runtime and local Chinese model paths. Resolution priority is explicit CLI
+argument, environment variable, YAML value, then generated-timing fallback.
+Use `--whisperx_runtime_dir`, `--whisperx_model`, `--whisperx_language`,
+`--whisperx_device cuda`, and `--whisperx_timeout_seconds` for one-off
+overrides. The corresponding environment variables are
+`OMNIVOICE_WHISPERX_RUNTIME_DIR` and `OMNIVOICE_WHISPERX_MODEL`. Alignment
 failure, timeout, OOM, unavailable CUDA, or TTS GPU-release failure preserves
 generated audio and uses pronunciation-weight subtitle timing; it never falls
 back to CPU WhisperX.

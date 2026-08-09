@@ -31,3 +31,4 @@ examples/exp*
 *.jsonl
 output/
 docs/superpowers/
+config.yaml

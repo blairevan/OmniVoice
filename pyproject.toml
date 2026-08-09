@@ -41,6 +41,7 @@ dependencies = [
     "numpy",
     "soundfile",
     "librosa",
+    "pyyaml>=6.0,<7",
 ]
 
 [project.optional-dependencies]
